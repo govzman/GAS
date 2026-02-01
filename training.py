@@ -7,7 +7,7 @@ from ml_collections import ConfigDict
 from torch_ema import ExponentialMovingAverage
 from tqdm import tqdm
 
-import wandb
+import comet_ml
 from evaluate import NOT_LOG_KEYS, evaluate_wrapper
 from src.gas.gs_wrapper import GSWrapper
 from src.gas.synt_data import SyntDataset
@@ -34,14 +34,21 @@ def train(
     print(config)
     print("=" * 90 + "\n")
 
-    wandb.login(force=True)
-    wandb.init(
-        project=config.logging.project_name,
-        name=f"{config.logging.run_name}_{date_str}",
-        config=config,
-        save_code=True,
+    comet_ml.login()
+
+    if config.logging.mode == "offline":
+        exp_class = comet_ml.OfflineExperiment
+    else:
+        exp_class = comet_ml.Experiment
+
+    exp = exp_class(
+        project_name=config.logging.project_name,
+        workspace=config.logging.workspace,
+        experiment_key=None,
+        log_code=True
     )
-    wandb.run.log_code("./", include_fn=lambda path: path.endswith(".py"))
+    exp.set_name(config.logging.run_name)
+    exp.log_parameters(parameters=config)
 
     global_step = 0
     pbar = tqdm(range(config.training.n_iters), dynamic_ncols=True)
@@ -63,7 +70,7 @@ def train(
 
             if global_step % config.training.iters_to_accumulate == 0:
                 if global_step % config.logging.log_weights_freq == 0:
-                    log_grads(model=gs_wrapper, global_step=global_step)
+                    log_grads(exp=exp, model=gs_wrapper, global_step=global_step)
 
                 grad_norm = torch.nn.utils.clip_grad_norm_(gs_wrapper.parameters(), 1.0)
 
@@ -72,8 +79,8 @@ def train(
                 ema.update(gs_wrapper.parameters())
 
                 if global_step % config.logging.log_weights_freq == 0:
-                    log_t_steps(res_d["timesteps"], global_step=global_step)
-                    log_weights(model=gs_wrapper, global_step=global_step)
+                    log_t_steps(exp, res_d["timesteps"], global_step=global_step)
+                    log_weights(exp, model=gs_wrapper, global_step=global_step)
 
                 log_d["optim/grad_norm"] = grad_norm
                 log_d["optim/lr"] = optim.param_groups[0]["lr"]
@@ -82,13 +89,14 @@ def train(
                 if k not in NOT_LOG_KEYS:
                     log_d[f"train/{k}"] = v.mean().item()
 
-            wandb.log(log_d, step=global_step)
+            exp.log_metrics(log_d, step=global_step)
 
             if global_step % config.logging.eval_freq == 0 or global_step == 1:
                 if "x0_s" not in res_d:
                     with torch.no_grad():
                         res_d["x0_s"] = gs_wrapper.model.decode(res_d["latents_s"])
                 log_end_img(
+                    exp,
                     res_d["x0_s"],
                     res_d["x0_t"],
                     global_step=global_step,
@@ -96,6 +104,7 @@ def train(
                 )
 
                 evaluate_wrapper(
+                    exp=exp,
                     gs_wrapper=gs_wrapper,
                     data=data,
                     device=device,
@@ -105,13 +114,14 @@ def train(
 
                 with ema.average_parameters():
                     evaluate_wrapper(
+                        exp=exp,
                         gs_wrapper=gs_wrapper,
                         data=data,
                         device=device,
                         suff="_ema",
                         global_step=global_step,
                     )
-                    log_weights(model=gs_wrapper, global_step=global_step, suff="_ema")
+                    log_weights(exp=exp, model=gs_wrapper, global_step=global_step, suff="_ema")
 
             if global_step % config.logging.checkpoint_freq == 0 or global_step == 1:
                 torch.save(
@@ -126,4 +136,4 @@ def train(
 
             pbar.update(1)
 
-    wandb.finish()
+    comet_ml.finish()

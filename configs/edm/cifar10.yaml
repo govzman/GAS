@@ -10,9 +10,9 @@ dataset:
   use_latents: false
   use_condition: false
   train_size: null
-  batch_size: 24
-  validation_batch_size: 128
-  validation_size: 1000
+  batch_size: 2
+  validation_batch_size: 2
+  validation_size: 64
   size_vis: 16
   num_workers: 0
 
@@ -40,14 +40,17 @@ student_solver_config:
     disc_lr: 0.00001
 
 training:
-  n_iters: 10000
+  n_iters: 50
   lr: 0.001
   iters_to_accumulate: 1
   ema_decay: 0.999
 
 logging:
   project_name: GAS
-  eval_freq: 500
-  checkpoint_freq: 500
+  eval_freq: 5
+  checkpoint_freq: 5
   log_weights_freq: 10
-  run_name: null
+  run_name: "test_more_logging"
+  mode: online
+  workspace: govzman
+  project_name: test_GAS
