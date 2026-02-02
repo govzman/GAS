@@ -12,11 +12,11 @@ dataset:
   use_latents: true
   use_condition: true
   train_size: null
-  batch_size: 4
-  validation_batch_size: 16
-  validation_size: 128
-  size_vis: 16
-  num_workers: 0
+  batch_size: 1
+  validation_batch_size: 1
+  validation_size: 0
+  size_vis: 1
+  num_workers: 10
 
 teacher_solver_config:
   steps: null 
@@ -36,7 +36,7 @@ student_solver_config:
     loss_type: null
     loss_key: loss_l1_latents
     disc_weight: 1
-    disc_url_type: latent_4
+    disc_type: latent_4
     disc_lr: 0.00001
 
 training:
@@ -50,4 +50,7 @@ logging:
   eval_freq: 500
   checkpoint_freq: 500
   log_weights_freq: 10
-  run_name: null
+  run_name: "test_coco"
+  mode: online
+  workspace: govzman
+  project_name: test_GAS

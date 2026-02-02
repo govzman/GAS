@@ -80,11 +80,11 @@ class GSWrapper(nn.Module):
             cname, aname = f'c{i}_diff', f'a{i}_diff'
 
             self.register_parameter(
-                param=nn.Parameter(torch.zeros(self.steps), requires_grad=True),
+                param=nn.Parameter(torch.zeros(self.steps), requires_grad=self.solver_config.c_requires_grad),
                 name=cname
             )
             self.register_parameter(
-                param=nn.Parameter(torch.zeros(self.steps), requires_grad=True),
+                param=nn.Parameter(torch.zeros(self.steps), requires_grad=self.solver_config.a_requires_grad),
                 name=aname
             )
 

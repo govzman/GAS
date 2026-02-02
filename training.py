@@ -136,4 +136,4 @@ def train(
 
             pbar.update(1)
 
-    comet_ml.finish()
+    # comet_ml.finish()

@@ -10,11 +10,11 @@ dataset:
   use_latents: true
   use_condition: true
   train_size: null
-  batch_size: 8
-  validation_batch_size: 64
-  validation_size: 1000
-  size_vis: 16
-  num_workers: 0
+  batch_size: 1
+  validation_batch_size: 1
+  validation_size: 2
+  size_vis: 2
+  num_workers: 10
 
 teacher_solver_config:
   steps: 10 
@@ -31,6 +31,8 @@ student_solver_config:
   t_parametrization: mu_logit
   use_theory_coef: true
   guidance_scale: 2.
+  a_requires_grad: true
+  c_requires_grad: true
 
   loss_config:
     loss_type: null
@@ -40,14 +42,18 @@ student_solver_config:
     disc_lr: 0.00001
 
 training:
-  n_iters: 30000
+  n_iters: 1500
   lr: 0.001
   iters_to_accumulate: 1
   ema_decay: 0.999
 
 logging:
   project_name: GAS
-  eval_freq: 500
-  checkpoint_freq: 500
+  eval_freq: 100
+  checkpoint_freq: 100
   log_weights_freq: 10
-  run_name: null
+  run_name: "cin256_NFE=8_ts=2_with_grad"
+  mode: online
+  workspace: govzman
+  project_name: test_GAS
+  
