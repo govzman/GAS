@@ -31,8 +31,8 @@ student_solver_config:
   t_parametrization: mu_logit
   use_theory_coef: true
   guidance_scale: 2.
-  a_requires_grad: true
-  c_requires_grad: true
+  a_requires_grad: false
+  c_requires_grad: false
 
   loss_config:
     loss_type: null
@@ -52,7 +52,7 @@ logging:
   eval_freq: 100
   checkpoint_freq: 100
   log_weights_freq: 10
-  run_name: "cin256_NFE=8_ts=2_with_grad"
+  run_name: "cin256_NFE=8_ts=2_no_grad_class_emb"
   mode: online
   workspace: govzman
   project_name: test_GAS

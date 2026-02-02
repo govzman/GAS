@@ -71,9 +71,9 @@ class GSWrapper(nn.Module):
 
         solver.get_time_steps = lambda **kwargs: self.get_t_steps(**kwargs)
 
-        # init t_couple
-        self.t_couple = nn.Parameter(torch.zeros(self.steps), requires_grad=True)
-        solver.t_couple = self.t_couple
+        # init t_couple_layer
+        self.t_couple_layer = nn.Linear(512, self.steps)
+        solver.t_couple_layer = self.t_couple_layer
 
         # init coef
         for i in range(1, self.order + 1):
@@ -277,7 +277,6 @@ class GSWrapperLatent(GSWrapper):
         images = None
         if condition is not None:
             self.model.set_condition(condition)
-
         latents = self.solver.sample(
             x=noise,
             steps=self.steps,

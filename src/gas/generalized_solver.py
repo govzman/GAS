@@ -36,7 +36,10 @@ class GeneralizedSolver:
         Returns:
             torch.Tensor: Output of data prediction.
         """
-        noise = self.model_class(x, t + self.t_couple[self.params_step])
+        cond_emb = self.model_class.condition
+        t_couple_all = self.t_couple_layer(cond_emb)
+        t_couple_val = t_couple_all[0, 0, self.params_step]
+        noise = self.model_class(x, t + t_couple_val)
         alpha_t, sigma_t = self.noise_schedule.marginal_alpha(t), self.noise_schedule.marginal_std(t)
         x0 = (x - sigma_t * noise) / alpha_t
 
