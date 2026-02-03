@@ -26,7 +26,7 @@ class GeneralizedSolver:
 
         self.use_theory_coef = use_theory_coef
 
-    def model_fn(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+    def model_fn(self, x: torch.Tensor, t: torch.Tensor, t_addition: torch.Tensor) -> torch.Tensor:
         """Convert the model to the data prediction model.
         
         Args:
@@ -36,10 +36,7 @@ class GeneralizedSolver:
         Returns:
             torch.Tensor: Output of data prediction.
         """
-        cond_emb = self.model_class.condition
-        t_couple_all = self.t_couple_layer(cond_emb)
-        t_couple_val = t_couple_all[0, 0, self.params_step]
-        noise = self.model_class(x, t + t_couple_val)
+        noise = self.model_class(x, t + t_addition)
         alpha_t, sigma_t = self.noise_schedule.marginal_alpha(t), self.noise_schedule.marginal_std(t)
         x0 = (x - sigma_t * noise) / alpha_t
 
@@ -382,7 +379,12 @@ class GeneralizedSolver:
         assert timesteps.shape[0] - 1 == steps, f"timestep.shape = {timesteps.shape}"
         t = timesteps[0]
         t_prev_list = [t]
-        model_prev_list = [self.model_fn(x, t)]
+
+        cond_emb = self.model_class.condition
+        t_couple_logits = self.t_couple_layer(cond_emb)
+        t_couple_val = torch.tanh(t_couple_logits) * self.t_couple_scale
+        print('cond', self.model_class.class_label, 't_couple_val', t_couple_val)
+        model_prev_list = [self.model_fn(x, t, t_couple_val[0, 0, self.params_step])]
         x_prev_list = [x]
 
         for step in range(1, steps + 1):
@@ -396,7 +398,7 @@ class GeneralizedSolver:
 
             x_prev_list.append(x)
             t_prev_list.append(t)
-            model_prev_list.append(self.model_fn(x, t))
+            model_prev_list.append(self.model_fn(x, t, t_couple_val[0, 0, self.params_step]))
 
             x_prev_list = x_prev_list[-order:]
             t_prev_list = t_prev_list[-order:]

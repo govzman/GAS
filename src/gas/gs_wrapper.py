@@ -72,8 +72,11 @@ class GSWrapper(nn.Module):
         solver.get_time_steps = lambda **kwargs: self.get_t_steps(**kwargs)
 
         # init t_couple_layer
-        self.t_couple_layer = nn.Linear(512, self.steps)
+        self.t_couple_layer = nn.Linear(512, self.steps, bias=False)
+        nn.init.normal_(self.t_couple_layer.weight, mean=0.0, std=0.001)
+        self.t_couple_scale = nn.Parameter(torch.tensor(0.001))
         solver.t_couple_layer = self.t_couple_layer
+        solver.t_couple_scale = self.t_couple_scale
 
         # init coef
         for i in range(1, self.order + 1):

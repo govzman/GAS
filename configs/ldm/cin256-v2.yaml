@@ -42,7 +42,7 @@ student_solver_config:
     disc_lr: 0.00001
 
 training:
-  n_iters: 1500
+  n_iters: 5000
   lr: 0.001
   iters_to_accumulate: 1
   ema_decay: 0.999
@@ -52,7 +52,7 @@ logging:
   eval_freq: 100
   checkpoint_freq: 100
   log_weights_freq: 10
-  run_name: "cin256_NFE=8_ts=2_no_grad_class_emb"
+  run_name: "cin256_NFE=8_ts=8_no_grad_class_emb + tanh + scaler"
   mode: online
   workspace: govzman
   project_name: test_GAS

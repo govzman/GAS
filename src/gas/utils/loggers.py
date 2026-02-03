@@ -81,6 +81,9 @@ def log_weights(exp: comet_ml.Experiment, model: GSWrapper, global_step: int, su
     for t, p in model.named_parameters():
         if p.requires_grad:
             data = p.data.detach().clone().cpu().numpy()
+            if data.ndim == 0:
+                d[f"{key}_{t}/scalar"] = float(data)
+                continue
             if np.prod(data.shape) > 12:
                 d[f"{key}/{t}_norm"] = np.linalg.norm(data)
                 continue
@@ -97,6 +100,9 @@ def log_grads(exp: comet_ml.Experiment, model: GSWrapper, global_step: int) -> N
     for t, p in model.named_parameters():
         if p.requires_grad and p.grad is not None:
             data = p.grad.detach().clone().cpu().numpy()
+            if data.ndim == 0:
+                d[f"{key}_{t}/scalar"] = data.item()
+                continue
             if np.prod(data.shape) > 12:
                 d[f"{key}/{t}_norm"] = np.linalg.norm(data)
                 continue

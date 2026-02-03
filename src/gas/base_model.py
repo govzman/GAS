@@ -271,6 +271,7 @@ class LDMModel(BaseModel):
         assert condition is not None, 'The conditioned passed is None'
         
         bs = len(condition)
+        self.model_fn.class_label = condition
         condition = self.model.get_learned_conditioning(
             {self.model.cond_stage_key: condition}
         )
