@@ -14,13 +14,13 @@ dataset:
   train_size: null
   batch_size: 1
   validation_batch_size: 1
-  validation_size: 0
-  size_vis: 1
+  validation_size: 1
+  size_vis: 4
   num_workers: 10
 
 teacher_solver_config:
   steps: null 
-  order: 2
+  order: 3
   t_eps: 0.001
   guidance_scale: 7.5
 
@@ -31,6 +31,9 @@ student_solver_config:
   t_parametrization: mu_logit
   use_theory_coef: true
   guidance_scale: 7.5
+  t_couple_requires_grad: false
+  a_requires_grad: false
+  c_requires_grad: false
 
   loss_config:
     loss_type: null
@@ -50,7 +53,7 @@ logging:
   eval_freq: 500
   checkpoint_freq: 500
   log_weights_freq: 10
-  run_name: "test_coco"
+  run_name: "coco_baseline"
   mode: online
   workspace: govzman
   project_name: test_GAS

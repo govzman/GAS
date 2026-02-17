@@ -1,9 +1,9 @@
 #! /bin/bash
 
-config_name="configs/edm/cifar10.yaml"
+config_name="configs/sd/coco.yaml"
 loss_type="GS"
-NFE=4
-train_size=1400
+NFE=5
+train_size=4
 
 python main.py \
     --config=$config_name \

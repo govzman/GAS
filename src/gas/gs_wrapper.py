@@ -63,20 +63,25 @@ class GSWrapper(nn.Module):
         self.order = self.solver_config.order
 
         # init t steps
-        assert self.solver_config.t_parametrization == "mu_logit"
-        self.eps_mu_offset = 1e-5
-        self.mu_logit = nn.Parameter(torch.ones(self.steps - 1), requires_grad=True)
-        t_unif = torch.linspace(1., self.t_eps, self.steps + 1).flip(0)
-        self.mu_logit.data = self.get_inv_t_steps(t_unif)
+        if self.solver_config.t_parametrization == "mu_logit":
+            self.eps_mu_offset = 1e-5
+            self.mu_logit = nn.Parameter(torch.ones(self.steps - 1), requires_grad=True)
+            t_unif = torch.linspace(1., self.t_eps, self.steps + 1).flip(0)
+            self.mu_logit.data = self.get_inv_t_steps(t_unif)
+        elif self.solver_config.t_parametrization == "content_aware":
+            self.eps_mu_offset = 1e-5
+            self.mu_logit = nn.Linear(in_features=512, out_features=self.steps - 1)
+            nn.init.zeros_(self.mu_logit.weight)
+            t_unif = torch.linspace(1., self.t_eps, self.steps + 1).flip(0)
+            self.mu_logit.bias = self.get_inv_t_steps(t_unif)
+        else:
+            raise NotImplementedError()
 
         solver.get_time_steps = lambda **kwargs: self.get_t_steps(**kwargs)
 
-        # init t_couple_layer
-        self.t_couple_layer = nn.Linear(512, self.steps, bias=False)
-        nn.init.normal_(self.t_couple_layer.weight, mean=0.0, std=0.001)
-        self.t_couple_scale = nn.Parameter(torch.tensor(0.001))
-        solver.t_couple_layer = self.t_couple_layer
-        solver.t_couple_scale = self.t_couple_scale
+        # init t_couple
+        self.t_couple = nn.Parameter(torch.zeros(self.steps), requires_grad=self.solver_config.t_couple_requires_grad)
+        solver.t_couple = self.t_couple
 
         # init coef
         for i in range(1, self.order + 1):
@@ -106,9 +111,15 @@ class GSWrapper(nn.Module):
         self.solver = solver
 
     # timesteps logic
-    def get_t_steps(self, **kwargs) -> torch.Tensor:
+    def get_t_steps(self, cond_emb=None, **kwargs) -> torch.Tensor:
         """Get generation timesteps."""
-        logits = self.mu_logit
+        if self.solver_config.t_parametrization == "mu_logit":
+            logits = self.mu_logit
+        elif self.solver_config.t_parametrization == "content_aware":
+            if cond_emb:
+                logits = self.mu_logit(cond_emb)
+            else:
+                logits = self.mu_logit.bias
         t = self.get_mu_t_steps(logits)
         
         return t.flip(0)
