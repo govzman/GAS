@@ -315,9 +315,16 @@ class SDModel(LDMModel):
         return list(self.condition_loader[idxs])
     
     def forward(self, x: torch.Tensor, t: torch.Tensor, cond: Optional[torch.Tensor] = None) -> torch.Tensor:
+        if t.ndim == 0 or t.numel() == 1:
+            t_input = t.reshape(1).expand((x.shape[0]))
+        elif t.ndim == 1 and t.shape[0] == x.shape[0]:
+            t_input = t
+        else:
+            raise ValueError(f"Unexpected t shape {tuple(t.shape)} for x batch {x.shape[0]}")
+
         output = cp.checkpoint(
             self.model.apply_model, 
-            x, t.expand((x.shape[0])), cond, 
+            x, t_input, cond, 
             use_reentrant=False
         )
         return output

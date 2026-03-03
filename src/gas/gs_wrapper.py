@@ -70,14 +70,15 @@ class GSWrapper(nn.Module):
             self.mu_logit.data = self.get_inv_t_steps(t_unif)
         elif self.solver_config.t_parametrization == "content_aware":
             self.eps_mu_offset = 1e-5
-            self.mu_logit = nn.Linear(in_features=512, out_features=self.steps - 1)
+            self.mu_logit = nn.Linear(in_features=768, out_features=self.steps - 1)
             nn.init.zeros_(self.mu_logit.weight)
             t_unif = torch.linspace(1., self.t_eps, self.steps + 1).flip(0)
-            self.mu_logit.bias = self.get_inv_t_steps(t_unif)
+            with torch.no_grad():
+                self.mu_logit.bias.copy_(self.get_inv_t_steps(t_unif))
         else:
             raise NotImplementedError()
 
-        solver.get_time_steps = lambda **kwargs: self.get_t_steps(**kwargs)
+        solver.get_time_steps = lambda *args, **kwargs: self.get_t_steps(*args, **kwargs)
 
         # init t_couple
         self.t_couple = nn.Parameter(torch.zeros(self.steps), requires_grad=self.solver_config.t_couple_requires_grad)
@@ -116,8 +117,8 @@ class GSWrapper(nn.Module):
         if self.solver_config.t_parametrization == "mu_logit":
             logits = self.mu_logit
         elif self.solver_config.t_parametrization == "content_aware":
-            if cond_emb:
-                logits = self.mu_logit(cond_emb)
+            if cond_emb is not None:
+                logits = self.mu_logit(cond_emb)[:, 0, :].T
             else:
                 logits = self.mu_logit.bias
         t = self.get_mu_t_steps(logits)

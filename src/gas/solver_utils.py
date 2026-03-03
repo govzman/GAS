@@ -303,15 +303,23 @@ def model_wrapper(
             """
             The noise predicition model function that is used for DPM-Solver.
             """
+            if t_continuous.ndim == 0 or t_continuous.numel() == 1:
+                t_batch = t_continuous.reshape(1).expand(x.shape[0])
+            elif t_continuous.ndim == 1 and t_continuous.shape[0] == x.shape[0]:
+                t_batch = t_continuous
+            else:
+                raise ValueError(
+                    f"Unexpected t_continuous shape {tuple(t_continuous.shape)} for x batch {x.shape[0]}"
+                )
+
             if guidance_type == "uncond":
-                return noise_pred_fn(x, t_continuous)
+                return noise_pred_fn(x, t_batch)
             elif guidance_type == "classifier-free":
-                t_continuous = t_continuous.repeat(x.shape[0])
                 if guidance_scale == 1. or self.unconditional_condition is None:
-                    return noise_pred_fn(x, t_continuous, cond=self.condition)
+                    return noise_pred_fn(x, t_batch, cond=self.condition)
                 else:
                     x_in = torch.cat([x] * 2)
-                    t_in = torch.cat([t_continuous] * 2)
+                    t_in = torch.cat([t_batch] * 2)
                     c_in = torch.cat([self.unconditional_condition, self.condition])
                     noise_uncond, noise = noise_pred_fn(x_in, t_in, cond=c_in).chunk(2)
                     return noise_uncond + guidance_scale * (noise - noise_uncond)

@@ -26,7 +26,14 @@ class GeneralizedSolver:
 
         self.use_theory_coef = use_theory_coef
 
-    def model_fn(self, x: torch.Tensor, t: torch.Tensor, t_addition: torch.Tensor) -> torch.Tensor:
+    @staticmethod
+    def _match_coeff_shape(coeff: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
+        """Broadcast 1D time-dependent coefficients to the shape expected by `ref`."""
+        if coeff.ndim == 1 and ref.ndim > 1 and coeff.shape[0] == ref.shape[0]:
+            return coeff.view(coeff.shape[0], *([1] * (ref.ndim - 1)))
+        return coeff
+
+    def model_fn(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         """Convert the model to the data prediction model.
         
         Args:
@@ -38,6 +45,8 @@ class GeneralizedSolver:
         """
         noise = self.model_class(x, t + self.t_couple[self.params_step])
         alpha_t, sigma_t = self.noise_schedule.marginal_alpha(t), self.noise_schedule.marginal_std(t)
+        alpha_t = self._match_coeff_shape(alpha_t, x)
+        sigma_t = self._match_coeff_shape(sigma_t, x)
         x0 = (x - sigma_t * noise) / alpha_t
         return x0
 
@@ -172,7 +181,10 @@ class GeneralizedSolver:
         # Use S4S parametrization by the data prediction model from Appendix C.1
 
         a_ii, alpha_t, (_, _), (phi_1, _, _) = self.calc_vals(t_prev_list, t)
-        C = - phi_1 * alpha_t
+        a_ii = self._match_coeff_shape(a_ii, x)
+        alpha_t = self._match_coeff_shape(alpha_t, x)
+        phi_1 = self._match_coeff_shape(phi_1, x)
+        C = -phi_1 * alpha_t
         x_t = a_ii * x
 
         # LMS
@@ -217,6 +229,9 @@ class GeneralizedSolver:
         assert len(x_prev_list) == len(t_prev_list)
         model_prev_0 = model_prev_list[-1]
         a_ii, alpha_t, (_, _), (phi_1, _, _) = self.calc_vals(t_prev_list, t)
+        a_ii = self._match_coeff_shape(a_ii, x)
+        alpha_t = self._match_coeff_shape(alpha_t, x)
+        phi_1 = self._match_coeff_shape(phi_1, x)
 
         a1 = a_ii + self.a1_diff[self.params_step]
         c1 = alpha_t * phi_1 + self.c1_diff[self.params_step]
@@ -252,6 +267,10 @@ class GeneralizedSolver:
         assert len(x_prev_list) == len(t_prev_list)
         model_prev_1, model_prev_0 = model_prev_list[-2], model_prev_list[-1]
         a_ii, alpha_t, (r0, _), (phi_1, _, _) = self.calc_vals(t_prev_list, t)
+        a_ii = self._match_coeff_shape(a_ii, x)
+        alpha_t = self._match_coeff_shape(alpha_t, x)
+        phi_1 = self._match_coeff_shape(phi_1, x)
+        r0 = self._match_coeff_shape(r0, model_prev_0)
 
         D1_0 = (1. / r0) * (model_prev_0 - model_prev_1)
 
@@ -291,6 +310,13 @@ class GeneralizedSolver:
         assert len(x_prev_list) == len(t_prev_list)
         model_prev_2, model_prev_1, model_prev_0 = model_prev_list[-3], model_prev_list[-2], model_prev_list[-1]
         a_ii, alpha_t, (r0, r1), (phi_1, phi_2, phi_3) = self.calc_vals(t_prev_list, t)
+        a_ii = self._match_coeff_shape(a_ii, x)
+        alpha_t = self._match_coeff_shape(alpha_t, x)
+        phi_1 = self._match_coeff_shape(phi_1, x)
+        phi_2 = self._match_coeff_shape(phi_2, x)
+        phi_3 = self._match_coeff_shape(phi_3, x)
+        r0 = self._match_coeff_shape(r0, model_prev_0)
+        r1 = self._match_coeff_shape(r1, model_prev_0)
 
         D1_0 = (1. / r0) * (model_prev_0 - model_prev_1)
         D1_1 = (1. / r1) * (model_prev_1 - model_prev_2)

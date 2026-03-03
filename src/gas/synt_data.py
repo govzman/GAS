@@ -60,10 +60,11 @@ class SyntDataLoaders:
         """
 
         train_dataset = torch.utils.data.Subset(
-            dataset, range(self.config.train_size))
+            dataset, range(self.config.dataset_shift, self.config.dataset_shift + self.config.train_size))
 
         test_dataset = torch.utils.data.Subset(
-            dataset, range(len(dataset) - self.config.validation_size, len(dataset)))
+            # dataset, range(len(dataset) - self.config.validation_size, len(dataset)))
+            dataset, range(self.config.dataset_shift, self.config.dataset_shift + self.config.validation_size))
 
         self.train_loader = DataLoader(
             train_dataset,
