@@ -3,7 +3,7 @@
 config_name="configs/sd/coco.yaml"
 loss_type="GS"
 NFE=4
-train_size=1
+train_size=4
 
 python main.py \
     --config=$config_name \

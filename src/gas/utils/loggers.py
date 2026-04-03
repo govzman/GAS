@@ -23,20 +23,35 @@ def log_plt_fig(exp: comet_ml.Experiment, fig, key: str, global_step: int) -> No
 def log_t_steps_plot(
     exp: comet_ml.Experiment, t_steps: torch.Tensor, global_step: int = None, key: str = None
 ) -> None:
-
+    # Переносим на CPU и преобразуем в numpy
     t_steps = t_steps.detach().cpu().numpy()
+    print('???', t_steps.shape)
+    print(t_steps)
+
+    # Если одномерный, делаем вид [steps, 1]
+    if t_steps.ndim == 1:
+        t_steps = t_steps[:, None]
+
+    steps, batch_size = t_steps.shape
 
     fig, ax = plt.subplots(1, 1, figsize=(4, 4))
-    ax.plot(t_steps)
+
+    # Рисуем каждую траекторию из батча
+    for i in range(batch_size):
+        color = plt.cm.tab10(i % 10)  # циклические цвета
+        ax.plot(t_steps[:, i], alpha=0.5, linestyle='--', color=color)
+
+    # Рисуем усреднённую линию
+    mean_vals = t_steps.mean(axis=1)
+    ax.plot(mean_vals, color='black', linewidth=2, label='Mean')
 
     ax.set_xlabel("Step")
     ax.set_ylabel("Time")
-    ax.grid()
+    ax.grid(True)
+    ax.legend()
 
-    if global_step is None:
-        return
-
-    log_plt_fig(exp=exp, fig=fig, key=key, global_step=global_step)
+    if global_step is not None:
+        log_plt_fig(exp=exp, fig=fig, key=key, global_step=global_step)
 
 
 @torch.no_grad()
@@ -114,10 +129,16 @@ def log_grads(exp: comet_ml.Experiment, model: GSWrapper, global_step: int) -> N
 
 @torch.no_grad()
 def log_t_steps(exp: comet_ml.Experiment, t_steps: torch.Tensor, global_step: int, key: str = "t_stats") -> None:
-    t_steps = t_steps.detach().clone().cpu().numpy()
-
+    t_steps = t_steps.detach().clone().cpu()
+    
+    # Если тензор двумерный, берём первый элемент по batch_size
+    if t_steps.dim() == 2:
+        t_steps = t_steps[:, 0]          # shape: [steps]
+    
+    t_steps = t_steps.numpy()            # преобразуем в numpy для логирования
+    
     d = {}
     for i, t in enumerate(t_steps):
         d[f"{key}/t_{i:02d}"] = t
-
+    
     exp.log_metrics(d, step=global_step)

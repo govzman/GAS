@@ -68,13 +68,26 @@ class GSWrapper(nn.Module):
             self.mu_logit = nn.Parameter(torch.ones(self.steps - 1), requires_grad=True)
             t_unif = torch.linspace(1., self.t_eps, self.steps + 1).flip(0)
             self.mu_logit.data = self.get_inv_t_steps(t_unif)
-        elif self.solver_config.t_parametrization == "content_aware":
+        elif self.solver_config.t_parametrization == "linear":
             self.eps_mu_offset = 1e-5
             self.mu_logit = nn.Linear(in_features=768, out_features=self.steps - 1)
             nn.init.zeros_(self.mu_logit.weight)
+            # nn.init.kaiming_uniform_(self.mu_logit.weight, a=0.1)
             t_unif = torch.linspace(1., self.t_eps, self.steps + 1).flip(0)
             with torch.no_grad():
                 self.mu_logit.bias.copy_(self.get_inv_t_steps(t_unif))
+        elif self.solver_config.t_parametrization == "mlp":
+            self.eps_mu_offset = 1e-5
+            self.mu_logit = nn.Sequential(
+                nn.Linear(in_features=768, out_features=768 * 4, bias=False),
+                nn.LeakyReLU(),
+                nn.Linear(in_features=768 * 4, out_features=self.steps - 1)
+            )
+            nn.init.kaiming_uniform_(self.mu_logit[0].weight, a=0.2)
+            nn.init.zeros_(self.mu_logit[2].weight)
+            t_unif = torch.linspace(1., self.t_eps, self.steps + 1).flip(0)
+            with torch.no_grad():
+                self.mu_logit[2].bias.copy_(self.get_inv_t_steps(t_unif))
         else:
             raise NotImplementedError()
 
@@ -116,11 +129,24 @@ class GSWrapper(nn.Module):
         """Get generation timesteps."""
         if self.solver_config.t_parametrization == "mu_logit":
             logits = self.mu_logit
-        elif self.solver_config.t_parametrization == "content_aware":
+        elif self.solver_config.t_parametrization == "linear":
+            if cond_emb is not None:
+                B = cond_emb.shape[0]
+                if torch.isnan(self.mu_logit.weight).any():
+                    print(f"⚠️ NaN в mu_logit.weight!")
+                if torch.isnan(self.mu_logit.bias).any():
+                    print(f"⚠️ NaN в mu_logit.bias!")
+                cond_emb = cond_emb.mean(dim=1)
+		# cond_emb = cond_emb / cond_emb.norm(dim=-1, keepdim=True)
+                logits = self.mu_logit(cond_emb).T
+		# logits = self.mu_logit(cond_emb.reshape(B, -1)).T
+            else:
+                logits = self.mu_logit.bias
+        elif self.solver_config.t_parametrization == "mlp":
             if cond_emb is not None:
                 logits = self.mu_logit(cond_emb)[:, 0, :].T
             else:
-                logits = self.mu_logit.bias
+                logits = self.mu_logit[2].bias
         t = self.get_mu_t_steps(logits)
         
         return t.flip(0)
@@ -309,7 +335,12 @@ class GSWrapperLatent(GSWrapper):
 
         d = {}
         if return_timesteps:
-            d['timesteps'] = self.solver.get_time_steps()
+            cond_emb = self.model.model_fn.condition
+            print('??', cond_emb.shape if cond_emb is not None else None)
+            d['timesteps'] = self.solver.get_time_steps(cond_emb)
+            print(d['timesteps'])
+            print(condition)
+            print(cond_emb)
         student_latents, _ = self.student_sampler_fn(
             noise,
             condition=condition
