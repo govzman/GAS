@@ -1,0 +1,23 @@
+defaults:
+  - model: coco
+  - writer: cometml
+  - metrics: avss
+  - datasets: coco
+  - dataloader: coco
+  - _self_
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 1e-3
+
+loss_config:
+  loss_type: "GS"
+  loss_key: loss_l1_latents
+  disc_weight: 1
+  disc_type: latent_4
+  disc_lr: 0.00001
+  
+trainer:
+  n_iters: 2000
+  iters_to_accumulate: 2
+  ema_decay: 0.999

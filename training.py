@@ -3,19 +3,19 @@ import os
 import time
 
 import torch
-from ml_collections import ConfigDict
 from torch_ema import ExponentialMovingAverage
 from tqdm import tqdm
 
 import comet_ml
+from omegaconf import OmegaConf
 from evaluate import NOT_LOG_KEYS, evaluate_wrapper
-from src.gas.gs_wrapper import GSWrapper
-from src.gas.synt_data import SyntDataset
-from src.gas.utils.loggers import log_end_img, log_grads, log_t_steps, log_weights
+from src.models.gas.gs_wrapper import GSWrapper
+from src.models.gas.synt_data import SyntDataset
+from src.models.gas.utils.loggers import log_end_img, log_grads, log_t_steps, log_weights
 
 
 def train(
-    config: ConfigDict,
+    config,
     gs_wrapper: GSWrapper,
     ema: ExponentialMovingAverage,
     data: SyntDataset,
@@ -43,12 +43,12 @@ def train(
 
     exp = exp_class(
         project_name=config.logging.project_name,
-        workspace=config.logging.workspace,
+        workspace=getattr(config.logging, "workspace", None),
         experiment_key=None,
         log_code=True
     )
     exp.set_name(config.logging.run_name)
-    exp.log_parameters(parameters=config)
+    exp.log_parameters(parameters=OmegaConf.to_container(config, resolve=True))
 
     global_step = 0
     pbar = tqdm(range(config.training.n_iters), dynamic_ncols=True)

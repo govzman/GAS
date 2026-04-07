@@ -1,0 +1,18 @@
+student_solver_config:
+  steps: null
+  order: null
+  t_eps: 0.001
+  t_parametrization: mu_logit
+  use_theory_coef: true
+  guidance_scale: 7.5
+  t_couple_requires_grad: false
+  a_requires_grad: false
+  c_requires_grad: false
+
+  loss_config:
+    loss_type: null
+    loss_key: loss_l1_latents
+    disc_weight: 1
+    disc_type: latent_4
+    disc_lr: 0.00001
+

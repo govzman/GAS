@@ -2,16 +2,15 @@ import os
 import re
 from functools import partial
 
-import click
+import hydra
 import numpy as np
 import PIL.Image
 import torch
 import tqdm
-import yaml
-from ml_collections import ConfigDict
+from omegaconf import DictConfig, OmegaConf
 
-from src.gas.models import get_gs_wrapper, load_base_model
-from src.gas.sampling_algs import SAMPLING_ALGS
+from models.gas.models import get_gs_wrapper, load_base_model
+from models.gas.sampling_algs import SAMPLING_ALGS
 from torch_utils import distributed as dist
 
 
@@ -70,55 +69,17 @@ def parse_int_list(s):
 # ----------------------------------------------------------------------------
 
 
-@click.command()
-@click.option(
-    "--config", "config_path", help="", metavar="PATH", type=str, required=True
-)
-@click.option(
-    "--outdir",
-    help="Where to save the output images",
-    metavar="DIR",
-    type=str,
-    required=True,
-)
-@click.option(
-    "--seeds",
-    help="Random seeds (e.g. 1,2,5-10)",
-    metavar="LIST",
-    type=parse_int_list,
-    default="0-63",
-    show_default=True,
-)
-@click.option(
-    "--batch",
-    "max_batch_size",
-    help="Maximum batch size",
-    metavar="INT",
-    type=click.IntRange(min=1),
-    default=64,
-    show_default=True,
-)
-@click.option(
-    "--steps",
-    "num_steps",
-    help="Number of sampling steps",
-    metavar="INT",
-    type=click.IntRange(min=1),
-    required=False,
-    default=None,
-)
-@click.option("--checkpoint_path", help="GS checkpoint path", metavar="PATH", type=str)
-@click.option("--create_dataset", help="", metavar="BOOL", type=bool, default=False)
-def main(
-    config_path,
-    outdir,
-    seeds,
-    max_batch_size,
-    num_steps,
-    checkpoint_path,
-    create_dataset,
-    device=torch.device("cuda"),
-):
+@hydra.main(version_base=None, config_path="conf", config_name="generate")
+def main(cfg: DictConfig):
+    cfg = OmegaConf.create(OmegaConf.to_container(cfg, resolve=True))
+
+    outdir = cfg.outdir
+    seeds = parse_int_list(cfg.seeds)
+    max_batch_size = int(cfg.max_batch_size)
+    num_steps = cfg.num_steps
+    checkpoint_path = cfg.checkpoint_path
+    create_dataset = bool(cfg.create_dataset)
+    device = torch.device(cfg.device)
     dist.init()
 
     num_batches = (
@@ -131,8 +92,7 @@ def main(
     if dist.get_rank() != 0:
         torch.distributed.barrier()
 
-    with open(config_path) as stream:
-        config = ConfigDict(yaml.safe_load(stream))
+    config = cfg.config
 
     if create_dataset:
         synt_dir = os.path.join(outdir, "dataset")
