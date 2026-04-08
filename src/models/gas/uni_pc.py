@@ -13,7 +13,7 @@ Original code:
 """
 
 import torch
-from models.gas.solver_utils import expand_dims
+from src.models.gas.solver_utils import expand_dims
 
 class UniPC:
     def __init__(

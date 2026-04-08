@@ -2,9 +2,9 @@ import torch
 from ml_collections import ConfigDict
 from typing import Optional, Tuple, List
 
-from models.gas.base_model import BaseModel
-from models.gas.uni_pc import UniPC
-from models.ld3.ipndm import iPNDM
+from src.models.gas.base_model import BaseModel
+from src.models.gas.uni_pc import UniPC
+from src.models.ld3.ipndm import iPNDM
 
 
 def uni_pc_sampler(

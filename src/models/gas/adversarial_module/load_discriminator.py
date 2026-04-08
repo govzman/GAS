@@ -1,7 +1,7 @@
 from torch import nn
 import dnnlib
-import models.gas.adversarial_module.legacy as legacy
-from models.R3GAN.Networks import Discriminator, Convolution
+import src.models.gas.adversarial_module.legacy as legacy
+from src.models.R3GAN.Networks import Discriminator, Convolution
 
 url_dict = {
     "CIFAR10": "https://huggingface.co/brownvc/R3GAN-CIFAR10/resolve/main/network-snapshot-final.pkl",

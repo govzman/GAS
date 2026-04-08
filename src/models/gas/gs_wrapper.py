@@ -7,10 +7,10 @@ from torch.nn.functional import interpolate
 from torch_ema import ExponentialMovingAverage
 from ml_collections import ConfigDict
 
-from models.gas.base_model import BaseModel
-from models.gas.generalized_solver import GeneralizedSolver
-from models.gas.adversarial_module.dist_adv_loss import DistAdversarialTraining
-from models.gas.synt_data import SyntDataType
+from src.models.gas.base_model import BaseModel
+from src.models.gas.generalized_solver import GeneralizedSolver
+from src.models.gas.adversarial_module.dist_adv_loss import DistAdversarialTraining
+from src.models.gas.synt_data import SyntDataType
 
 class GSWrapper(nn.Module):
     """Generalised Solver wrapper. 
@@ -31,20 +31,20 @@ class GSWrapper(nn.Module):
         adv_loss (DistAdversarialTraining): Adversarial training class instance. 
     """
     
-    def __init__(self, model: BaseModel, solver_config: ConfigDict):
+    def __init__(self, model: BaseModel, config: ConfigDict):
         """Initialize the Generalised Solver wrapper.
     
         Args:
             model (BaseModel): Instance of a BaseModel class. 
                 Its `decode`, `set_condition` methods and 
                 `model_fn`, `ns` and `t_eps` attributes are used.
-            solver_config (ConfigDict): Solver configuration dictionary.
+            config (ConfigDict): config, also include solver configuration dictionary.
                 Must include steps, order, loss_config, 
                 t_parametrization and use_theory_coef.
         """
         super().__init__()
         self.model = model
-        self.solver_config = solver_config
+        self.solver_config = config.student_solver
         self.t_eps = self.model.t_eps
         
         # create lpips
@@ -52,7 +52,7 @@ class GSWrapper(nn.Module):
         self.loss_fn_vgg.eval()
 
         # construct loss
-        self.loss_config = self.solver_config.loss_config
+        self.loss_config = config.loss_config
         assert self.loss_config.loss_type in ["GS", "GAS"]
         if self.loss_config.loss_type == "GAS":
             self.adv_loss = DistAdversarialTraining(self.loss_config)
@@ -296,8 +296,8 @@ class GSWrapper(nn.Module):
     
 class GSWrapperLatent(GSWrapper):
     """Generalised Solver wrapper adapted for latent models."""
-    def __init__(self, model: nn.Module, solver_config: ConfigDict):
-        super().__init__(model=model, solver_config=solver_config)
+    def __init__(self, model: nn.Module, config: ConfigDict):
+        super().__init__(model=model, config=config)
 
     def student_sampler_fn(
         self,

@@ -9,8 +9,8 @@ from omegaconf import OmegaConf
 from ml_collections import ConfigDict
 
 from typing import List, Tuple, Any, Optional
-from models.ldm.util import instantiate_from_config
-from models.gas.solver_utils import NoiseScheduleVP, model_wrapper
+from src.models.ldm.util import instantiate_from_config
+from src.models.gas.solver_utils import NoiseScheduleVP, model_wrapper
 
 class BaseModel:
     """Abstract base class for models with a unified interface.

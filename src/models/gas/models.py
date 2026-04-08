@@ -1,6 +1,6 @@
 import torch
-from models.gas.base_model import BaseModel, EDMModel, LDMModel, SDModel
-from models.gas.gs_wrapper import GSWrapper, GSWrapperLatent
+from src.models.gas.base_model import BaseModel, EDMModel, LDMModel, SDModel
+from src.models.gas.gs_wrapper import GSWrapper, GSWrapperLatent
 from omegaconf import DictConfig
 
 

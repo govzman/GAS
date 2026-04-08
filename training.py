@@ -27,7 +27,7 @@ def train(
 
     dir = os.path.join("./checkpoints", date_str)
     os.makedirs(dir, exist_ok=False)
-    config.training.checkpoints_dir = dir
+    config.trainer.checkpoints_dir = dir
 
     print(f"\n🚀 START TRAINING: {date_str}")
     print("=" * 40 + " Config Info " + "=" * 40)
@@ -36,26 +36,26 @@ def train(
 
     comet_ml.login()
 
-    if config.logging.mode == "offline":
+    if config.writer.mode == "offline":
         exp_class = comet_ml.OfflineExperiment
     else:
         exp_class = comet_ml.Experiment
 
     exp = exp_class(
-        project_name=config.logging.project_name,
-        workspace=getattr(config.logging, "workspace", None),
+        project_name=config.writer.project_name,
+        workspace=getattr(config.writer, "workspace", None),
         experiment_key=None,
         log_code=True
     )
-    exp.set_name(config.logging.run_name)
+    exp.set_name(config.writer.run_name)
     exp.log_parameters(parameters=OmegaConf.to_container(config, resolve=True))
 
     global_step = 0
-    pbar = tqdm(range(config.training.n_iters), dynamic_ncols=True)
+    pbar = tqdm(range(config.trainer.n_iters), dynamic_ncols=True)
 
-    for _ in range(config.training.epoch_num):
+    for _ in range(config.trainer.epoch_num):
         for batch in data.train_loader:
-            if global_step == config.training.n_iters:
+            if global_step == config.trainer.n_iters:
                 break
             global_step += 1
 
@@ -64,12 +64,12 @@ def train(
             batch = [v.to(device) if isinstance(v, torch.Tensor) else v for v in batch]
 
             res_d = gs_wrapper.forward(batch=batch, return_timesteps=True)
-            loss = res_d["loss_total"].mean() / config.training.iters_to_accumulate
+            loss = res_d["loss_total"].mean() / config.trainer.iters_to_accumulate
             loss.backward()
             log_d = {"optim/time": time.time() - t_start}
 
-            if global_step % config.training.iters_to_accumulate == 0:
-                if global_step % config.logging.log_weights_freq == 0:
+            if global_step % config.trainer.iters_to_accumulate == 0:
+                if global_step % config.writer.log_weights_freq == 0:
                     log_grads(exp=exp, model=gs_wrapper, global_step=global_step)
 
                 grad_norm = torch.nn.utils.clip_grad_norm_(gs_wrapper.parameters(), 1.0)
@@ -78,7 +78,7 @@ def train(
                 optim.zero_grad()
                 ema.update(gs_wrapper.parameters())
 
-                if global_step % config.logging.log_weights_freq == 0:
+                if global_step % config.writer.log_weights_freq == 0:
                     log_t_steps(exp, res_d["timesteps"], global_step=global_step)
                     log_weights(exp, model=gs_wrapper, global_step=global_step)
 
@@ -91,7 +91,7 @@ def train(
 
             exp.log_metrics(log_d, step=global_step)
 
-            if global_step % config.logging.eval_freq == 0 or global_step == 1:
+            if global_step % config.writer.eval_freq == 0 or global_step == 1:
                 if "x0_s" not in res_d:
                     with torch.no_grad():
                         res_d["x0_s"] = gs_wrapper.model.decode(res_d["latents_s"])
@@ -123,7 +123,7 @@ def train(
                     )
                     log_weights(exp=exp, model=gs_wrapper, global_step=global_step, suff="_ema")
 
-            if global_step % config.logging.checkpoint_freq == 0 or global_step == 1:
+            if global_step % config.writer.checkpoint_freq == 0 or global_step == 1:
                 torch.save(
                     {
                         "ema": ema.state_dict(),

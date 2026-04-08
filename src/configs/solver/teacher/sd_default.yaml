@@ -1,6 +1,0 @@
-teacher_solver_config:
-  steps: null
-  order: 3
-  t_eps: 0.001
-  guidance_scale: 7.5
-

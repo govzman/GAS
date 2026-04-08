@@ -1,0 +1,9 @@
+steps: 4
+order: 3
+t_eps: 0.001
+t_parametrization: mu_logit
+use_theory_coef: true
+guidance_scale: 7.5
+t_couple_requires_grad: false
+a_requires_grad: false
+c_requires_grad: false

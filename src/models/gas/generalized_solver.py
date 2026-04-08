@@ -1,7 +1,7 @@
 import torch
 from typing import List, Tuple, Optional, Any
 
-from models.gas.solver_utils import NoiseScheduleVP
+from src.models.gas.solver_utils import NoiseScheduleVP
 
 class GeneralizedSolver:
     """Generalized solver for diffusion ODE using theoretical guidance from DPM-Solver.

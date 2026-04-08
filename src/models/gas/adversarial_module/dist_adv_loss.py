@@ -12,7 +12,7 @@ See:
 import torch
 import torch.nn as nn
 
-from models.gas.adversarial_module.load_discriminator import load_r3gan_disc
+from src.models.gas.adversarial_module.load_discriminator import load_r3gan_disc
 
 class DistAdversarialTraining:
     def __init__(self, config_loss):

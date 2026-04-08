@@ -1,9 +1,7 @@
-logging:
-  project_name: test_GAS
-  eval_freq: 500
-  checkpoint_freq: 500
-  log_weights_freq: 10
-  run_name: coco_baseline
-  mode: online
-  workspace: govzman
-
+project_name: test_GAS
+eval_freq: 500
+checkpoint_freq: 500
+log_weights_freq: 10
+run_name: test
+mode: online
+workspace: govzman

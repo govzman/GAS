@@ -4,7 +4,7 @@ import torch
 from torchvision.utils import make_grid
 
 import comet_ml
-from models.gas.gs_wrapper import GSWrapper
+from src.models.gas.gs_wrapper import GSWrapper
 
 
 def log_plt_fig(exp: comet_ml.Experiment, fig, key: str, global_step: int) -> None:

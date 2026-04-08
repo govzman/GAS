@@ -3,9 +3,9 @@ from collections import defaultdict
 import torch
 
 import comet_ml
-from models.gas.gs_wrapper import GSWrapper
-from models.gas.synt_data import SyntDataLoaders
-from models.gas.utils.loggers import log_end_img, log_t_steps_plot
+from src.models.gas.gs_wrapper import GSWrapper
+from src.models.gas.synt_data import SyntDataLoaders
+from src.models.gas.utils.loggers import log_end_img, log_t_steps_plot
 
 NOT_LOG_KEYS = ["timesteps", "x0_s", "x0_t", "latents_s"]
 
