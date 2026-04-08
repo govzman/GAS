@@ -4,6 +4,8 @@ from hydra.utils import instantiate
 import torch
 from omegaconf import DictConfig, OmegaConf
 from torch_ema import ExponentialMovingAverage
+from accelerate import Accelerator
+from accelerate.utils import DistributedDataParallelKwargs
 
 from src.models.gas.models import get_gs_wrapper, load_base_model
 from src.models.gas.synt_data import SyntDataLoaders
@@ -22,7 +24,21 @@ def main(config: DictConfig) -> None:
     # Freeze/resolve interpolations early (and make cfg printable).
     config = OmegaConf.create(OmegaConf.to_container(config, resolve=True))
 
+    # Accelerator handles device / DDP / mixed precision / grad accumulation.
+    # Keep device resolution only as a fallback for non-accelerate paths.
     device = _resolve_device(config.trainer.device)
+
+    accumulation_steps = getattr(config.trainer, "accumulation_steps", None)
+    if accumulation_steps is None:
+        accumulation_steps = getattr(config.trainer, "iters_to_accumulate", 1)
+    amp = getattr(config.trainer, "amp", "no")
+
+    accelerator = Accelerator(
+        gradient_accumulation_steps=accumulation_steps,
+        mixed_precision=amp,
+        kwargs_handlers=[DistributedDataParallelKwargs(find_unused_parameters=True)],
+    )
+    device = accelerator.device
 
     # Setup seed (kept separate from model/dataset config on purpose).
     set_global_seed(config.trainer.seed)
@@ -65,6 +81,7 @@ def main(config: DictConfig) -> None:
         data=data,
         optim=optim,
         device=device,
+        accelerator=accelerator,
     )
 
 

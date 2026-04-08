@@ -8,6 +8,7 @@ torch-ema==0.3
 # wandb==0.15.7
 comet_ml
 omegaconf==2.1.1
+accelerate
 einops==0.3.0
 pytorch-lightning==1.4.2
 torchmetrics==0.6.0
