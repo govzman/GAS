@@ -9,9 +9,9 @@ from tqdm import tqdm
 import comet_ml
 from omegaconf import OmegaConf
 from evaluate import NOT_LOG_KEYS, evaluate_wrapper
-from src.models.gas.gs_wrapper import GSWrapper
-from src.models.gas.synt_data import SyntDataset
-from src.models.gas.utils.loggers import log_end_img, log_grads, log_t_steps, log_weights
+from src.model.gas.gs_wrapper import GSWrapper
+from src.model.gas.synt_data import SyntDataset
+from src.model.gas.utils.loggers import log_end_img, log_grads, log_t_steps, log_weights
 from typing import Optional
 
 

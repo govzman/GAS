@@ -1,0 +1,10 @@
+_target_: src.scheduler_models.SchedulerTransformer
+image_encoder_depth: 2
+image_encoder_width: 32
+text_embed_dim: 768
+cross_attention_heads: 4
+attention_dim: 128
+number_of_transformer_blocks: 4 
+num_mlp_layers: 2
+hidden_dim: 256
+num_timesteps: 4

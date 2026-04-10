@@ -7,9 +7,9 @@ from torch_ema import ExponentialMovingAverage
 from accelerate import Accelerator
 from accelerate.utils import DistributedDataParallelKwargs
 
-from src.models.gas.models import get_gs_wrapper, load_base_model
-from src.models.gas.synt_data import SyntDataLoaders
-from src.models.gas.utils.random import set_global_seed
+from src.model.gas.models import get_gs_wrapper, load_base_model
+from src.model.gas.synt_data import SyntDataLoaders
+from src.model.gas.utils.random import set_global_seed
 from training import train
 
 

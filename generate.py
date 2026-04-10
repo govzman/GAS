@@ -9,8 +9,8 @@ import torch
 import tqdm
 from omegaconf import DictConfig, OmegaConf
 
-from models.gas.models import get_gs_wrapper, load_base_model
-from models.gas.sampling_algs import SAMPLING_ALGS
+from model.gas.models import get_gs_wrapper, load_base_model
+from model.gas.sampling_algs import SAMPLING_ALGS
 from torch_utils import distributed as dist
 
 

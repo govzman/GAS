@@ -1,5 +1,6 @@
 defaults:
   - model: coco
+  - scheduler_model: scheduler_transformer
   - writer: cometml
   - datasets: coco
   - student_solver: sd_student_default
