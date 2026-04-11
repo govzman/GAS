@@ -19,7 +19,8 @@ loss_config:
   disc_lr: 0.00001
   
 trainer:
-  n_iters: 2000
+  n_iters: 5000
+  epoch_num: 2500
   # Backward compatible: training.py used to read iters_to_accumulate directly.
   # With Accelerate we primarily use accumulation_steps.
   iters_to_accumulate: 2

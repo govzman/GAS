@@ -1,7 +1,7 @@
 steps: 4
 order: 3
 t_eps: 0.00001
-t_parametrization: transformer
+t_parametrization: transformer # linear
 use_theory_coef: true
 guidance_scale: 7.5
 t_couple_requires_grad: false

@@ -64,13 +64,12 @@ class GSWrapper(nn.Module):
         self.order = self.solver_config.order
 
         # init t steps
+        self.eps_mu_offset = 1e-5
         if self.solver_config.t_parametrization == "mu_logit":
-            self.eps_mu_offset = 1e-5
             self.mu_logit = nn.Parameter(torch.ones(self.steps - 1), requires_grad=True)
             t_unif = torch.linspace(1., self.t_eps, self.steps + 1).flip(0)
             self.mu_logit.data = self.get_inv_t_steps(t_unif)
         elif self.solver_config.t_parametrization == "linear":
-            self.eps_mu_offset = 1e-5
             self.mu_logit = nn.Linear(in_features=768, out_features=self.steps - 1)
             nn.init.zeros_(self.mu_logit.weight)
             # nn.init.kaiming_uniform_(self.mu_logit.weight, a=0.1)
@@ -78,7 +77,6 @@ class GSWrapper(nn.Module):
             with torch.no_grad():
                 self.mu_logit.bias.copy_(self.get_inv_t_steps(t_unif))
         elif self.solver_config.t_parametrization == "mlp":
-            self.eps_mu_offset = 1e-5
             self.mu_logit = nn.Sequential(
                 nn.Linear(in_features=768, out_features=768 * 4, bias=False),
                 nn.LeakyReLU(),
@@ -130,9 +128,10 @@ class GSWrapper(nn.Module):
         """Get generation timesteps."""
         if self.solver_config.t_parametrization == "mu_logit":
             logits = self.mu_logit
+            print('//', logits.shape)
         elif self.solver_config.t_parametrization == "linear":
             if cond_emb is not None:
-                B = cond_emb.shape[0]
+                # B = cond_emb.shape[0]
                 if torch.isnan(self.mu_logit.weight).any():
                     print(f"⚠️ NaN в mu_logit.weight!")
                 if torch.isnan(self.mu_logit.bias).any():
@@ -149,9 +148,12 @@ class GSWrapper(nn.Module):
             else:
                 logits = self.mu_logit[2].bias
         elif self.solver_config.t_parametrization == "transformer":
-            logits = self.mu_logit(noise, cond_emb).T
+            if cond_emb is not None:
+                logits = self.mu_logit(noise, cond_emb).T
+            else:
+                logits = self.mu_logit(noise[:1], torch.zeros(1, 77, 768).to('cuda'))[0].T # noise.shape[0], 
+                
         t = self.get_mu_t_steps(logits)
-        
         return t.flip(0)
     
     def get_mu_t_steps(self, mu_logit: torch.Tensor) -> torch.Tensor:
@@ -340,7 +342,7 @@ class GSWrapperLatent(GSWrapper):
         if return_timesteps:
             cond_emb = self.model.model_fn.condition
             print('??', cond_emb.shape if cond_emb is not None else None)
-            d['timesteps'] = self.solver.get_time_steps(cond_emb)
+            d['timesteps'] = self.solver.get_time_steps(noise, cond_emb)
             print(d['timesteps'])
             print(condition)
             print(cond_emb)
