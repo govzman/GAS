@@ -71,7 +71,7 @@ class GSWrapper(nn.Module):
             self.mu_logit.data = self.get_inv_t_steps(t_unif)
         elif self.solver_config.t_parametrization == "linear":
             self.mu_logit = nn.Linear(in_features=768, out_features=self.steps - 1)
-            nn.init.zeros_(self.mu_logit.weight)
+            nn.init.normal_(self.mu_logit.weight, std=0.02)
             # nn.init.kaiming_uniform_(self.mu_logit.weight, a=0.1)
             t_unif = torch.linspace(1., self.t_eps, self.steps + 1).flip(0)
             with torch.no_grad():
@@ -340,6 +340,8 @@ class GSWrapperLatent(GSWrapper):
 
         d = {}
         if return_timesteps:
+            if condition is not None:
+                self.model.set_condition(condition)
             cond_emb = self.model.model_fn.condition
             print('??', cond_emb.shape if cond_emb is not None else None)
             d['timesteps'] = self.solver.get_time_steps(noise, cond_emb)
