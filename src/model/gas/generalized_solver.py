@@ -26,6 +26,25 @@ class GeneralizedSolver:
 
         self.use_theory_coef = use_theory_coef
 
+    def _get_step_param(self, name: str, ref: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Get time-step dependent parameter for the current solver step.
+
+        Supports both:
+        - 1D tensors of shape (steps,)
+        - 2D tensors of shape (B, steps) for per-sample conditioning
+        """
+        p = self.__getattribute__(name)
+        if isinstance(p, torch.Tensor) and p.ndim == 2:
+            # (B, steps) -> (B,)
+            p = p[:, self.params_step]
+        else:
+            # (steps,) -> scalar
+            p = p[self.params_step]
+        if ref is not None:
+            p = self._match_coeff_shape(p, ref)
+        return p
+
     @staticmethod
     def _match_coeff_shape(coeff: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
         """Broadcast 1D time-dependent coefficients to the shape expected by `ref`."""
@@ -190,14 +209,14 @@ class GeneralizedSolver:
         # LMS
         prev_num = len(model_prev_list)
         for i in range(1, prev_num + 1):
-            ci = self.__getattribute__(f"c{i}_diff")[self.params_step]
+            ci = self._get_step_param(f"c{i}_diff", ref=x)
             x_t = x_t + C * ci * model_prev_list[-i]
 
         # LMS + PC
         # "A PC solver further refines this initial prediction, by subsequently applying Eq. (5) from S4S paper".
         x_t = a_ii * x_t
         for i in range(1, prev_num + 1):
-            ai = self.__getattribute__(f"a{i}_diff")[self.params_step]
+            ai = self._get_step_param(f"a{i}_diff", ref=x)
             x_t = x_t + C * ai * model_prev_list[-i]
 
         return x_t
@@ -233,8 +252,8 @@ class GeneralizedSolver:
         alpha_t = self._match_coeff_shape(alpha_t, x)
         phi_1 = self._match_coeff_shape(phi_1, x)
 
-        a1 = a_ii + self.a1_diff[self.params_step]
-        c1 = alpha_t * phi_1 + self.c1_diff[self.params_step]
+        a1 = a_ii + self._get_step_param("a1_diff", ref=x)
+        c1 = alpha_t * phi_1 + self._get_step_param("c1_diff", ref=x)
 
         x_t = a1 * x - c1 * model_prev_0
         return x_t
@@ -274,12 +293,12 @@ class GeneralizedSolver:
 
         D1_0 = (1. / r0) * (model_prev_0 - model_prev_1)
 
-        a1 = a_ii + self.a1_diff[self.params_step]
-        c1 = alpha_t * phi_1 + self.c1_diff[self.params_step]
-        c2 = 0.5 * (alpha_t * phi_1) + self.c2_diff[self.params_step]
+        a1 = a_ii + self._get_step_param("a1_diff", ref=x)
+        c1 = alpha_t * phi_1 + self._get_step_param("c1_diff", ref=x)
+        c2 = 0.5 * (alpha_t * phi_1) + self._get_step_param("c2_diff", ref=x)
 
         x_t = a1 * x - c1 * model_prev_0 - c2 * D1_0 
-        x_t = x_t + self.a2_diff[self.params_step] * x_prev_list[-2]
+        x_t = x_t + self._get_step_param("a2_diff", ref=x) * x_prev_list[-2]
         return x_t
 
     def unbound_update(
@@ -323,19 +342,19 @@ class GeneralizedSolver:
         D1 = D1_0 + (r0 / (r0 + r1)) * (D1_0 - D1_1)
         D2 = (1. / (r0 + r1)) * (D1_0 - D1_1)
 
-        a1 = a_ii + self.a1_diff[self.params_step]
-        c1 = alpha_t * phi_1 + self.c1_diff[self.params_step]
-        c2 = alpha_t * phi_2 + self.c2_diff[self.params_step]
-        c3 = alpha_t * phi_3 + self.c3_diff[self.params_step]
+        a1 = a_ii + self._get_step_param("a1_diff", ref=x)
+        c1 = alpha_t * phi_1 + self._get_step_param("c1_diff", ref=x)
+        c2 = alpha_t * phi_2 + self._get_step_param("c2_diff", ref=x)
+        c3 = alpha_t * phi_3 + self._get_step_param("c3_diff", ref=x)
 
         x_t = a1 * x - c1 * model_prev_0 + c2 * D1 - c3 * D2
         
         prev_num = len(model_prev_list)
         for i in range(4, prev_num + 1):
-            x_t = x_t + self.__getattribute__(f"c{i}_diff")[self.params_step] * model_prev_list[-i]
+            x_t = x_t + self._get_step_param(f"c{i}_diff", ref=x) * model_prev_list[-i]
 
         for i in range(2, prev_num + 1):
-            x_t = x_t + self.__getattribute__(f"a{i}_diff")[self.params_step] * x_prev_list[-i]
+            x_t = x_t + self._get_step_param(f"a{i}_diff", ref=x) * x_prev_list[-i]
         return x_t
 
     def solver_update(

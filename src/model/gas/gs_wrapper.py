@@ -96,21 +96,85 @@ class GSWrapper(nn.Module):
         self.t_couple = nn.Parameter(torch.zeros(self.steps), requires_grad=self.solver_config.t_couple_requires_grad)
         solver.t_couple = self.t_couple
 
-        # init coef
-        for i in range(1, self.order + 1):
-            cname, aname = f'c{i}_diff', f'a{i}_diff'
+        # init coef (a/c) parametrizations
+        self.a_parametrization = getattr(self.solver_config, "a_parametrization", "diff")
+        self.c_parametrization = getattr(self.solver_config, "c_parametrization", "diff")
 
-            self.register_parameter(
-                param=nn.Parameter(torch.zeros(self.steps), requires_grad=self.solver_config.c_requires_grad),
-                name=cname
-            )
-            self.register_parameter(
-                param=nn.Parameter(torch.zeros(self.steps), requires_grad=self.solver_config.a_requires_grad),
-                name=aname
-            )
+        self.a_diff_model = None
+        self.c_diff_model = None
+        self._a_bias = None
+        self._c_bias = None
 
-            solver.__setattr__(cname, self.__getattr__(cname))
-            solver.__setattr__(aname, self.__getattr__(aname))
+        if self.a_parametrization != "diff":
+            out_dim = self.order * self.steps
+            if self.a_parametrization == "linear":
+                self.a_diff_model = nn.Linear(in_features=768, out_features=out_dim)
+                nn.init.normal_(self.a_diff_model.weight, std=0.02)
+                nn.init.zeros_(self.a_diff_model.bias)
+            elif self.a_parametrization == "mlp":
+                self.a_diff_model = nn.Sequential(
+                    nn.Linear(in_features=768, out_features=768 * 4, bias=False),
+                    nn.LeakyReLU(),
+                    nn.Linear(in_features=768 * 4, out_features=out_dim),
+                )
+                nn.init.kaiming_uniform_(self.a_diff_model[0].weight, a=0.2)
+                nn.init.zeros_(self.a_diff_model[2].weight)
+                nn.init.zeros_(self.a_diff_model[2].bias)
+            elif self.a_parametrization == "transformer":
+                a_cfg = getattr(config, "a_scheduler_model", None)
+                if a_cfg is None:
+                    a_cfg = config.scheduler_model
+                self.a_diff_model = instantiate(a_cfg, num_timesteps=out_dim)
+            else:
+                raise ValueError(f"Unsupported a_parametrization={self.a_parametrization}")
+            # used when cond_emb is None
+            self._a_bias = nn.Parameter(torch.zeros(self.order, self.steps), requires_grad=self.solver_config.a_requires_grad)
+
+        if self.c_parametrization != "diff":
+            out_dim = self.order * self.steps
+            if self.c_parametrization == "linear":
+                self.c_diff_model = nn.Linear(in_features=768, out_features=out_dim)
+                nn.init.normal_(self.c_diff_model.weight, std=0.02)
+                nn.init.zeros_(self.c_diff_model.bias)
+            elif self.c_parametrization == "mlp":
+                self.c_diff_model = nn.Sequential(
+                    nn.Linear(in_features=768, out_features=768 * 4, bias=False),
+                    nn.LeakyReLU(),
+                    nn.Linear(in_features=768 * 4, out_features=out_dim),
+                )
+                nn.init.kaiming_uniform_(self.c_diff_model[0].weight, a=0.2)
+                nn.init.zeros_(self.c_diff_model[2].weight)
+                nn.init.zeros_(self.c_diff_model[2].bias)
+            elif self.c_parametrization == "transformer":
+                c_cfg = getattr(config, "c_scheduler_model", None)
+                if c_cfg is None:
+                    c_cfg = config.scheduler_model
+                self.c_diff_model = instantiate(c_cfg, num_timesteps=out_dim)
+            else:
+                raise ValueError(f"Unsupported c_parametrization={self.c_parametrization}")
+            self._c_bias = nn.Parameter(torch.zeros(self.order, self.steps), requires_grad=self.solver_config.c_requires_grad)
+
+        # baseline coefficients (current behavior)
+        if self.a_parametrization == "diff" and self.c_parametrization == "diff":
+            for i in range(1, self.order + 1):
+                cname, aname = f'c{i}_diff', f'a{i}_diff'
+
+                self.register_parameter(
+                    param=nn.Parameter(torch.zeros(self.steps), requires_grad=self.solver_config.c_requires_grad),
+                    name=cname
+                )
+                self.register_parameter(
+                    param=nn.Parameter(torch.zeros(self.steps), requires_grad=self.solver_config.a_requires_grad),
+                    name=aname
+                )
+
+                solver.__setattr__(cname, self.__getattr__(cname))
+                solver.__setattr__(aname, self.__getattr__(aname))
+        else:
+            # placeholders; actual tensors are set per sampling call
+            for i in range(1, self.order + 1):
+                solver.__setattr__(f'c{i}_diff', torch.zeros(self.steps))
+                solver.__setattr__(f'a{i}_diff', torch.zeros(self.steps))
 
         # theory coef
         solver.use_theory_coef = self.solver_config.use_theory_coef
@@ -122,6 +186,49 @@ class GSWrapper(nn.Module):
             )
         # end init solver
         self.solver = solver
+
+    def _update_dynamic_ac_coefs(self, noise: torch.Tensor, cond_emb: Optional[torch.Tensor]) -> None:
+        """
+        If enabled by config, compute batch-dependent a/c coefficient tables and
+        attach them to the solver as tensors of shape (B, steps).
+        """
+        if self.a_parametrization != "diff":
+            out_dim = self.order * self.steps
+            if self.a_parametrization in ("linear", "mlp"):
+                if cond_emb is not None:
+                    x = cond_emb.mean(dim=1)
+                    a_flat = self.a_diff_model(x)  # (B, out_dim)
+                else:
+                    a_flat = self._a_bias.reshape(1, out_dim)
+            else:  # transformer
+                if cond_emb is not None:
+                    a_flat = self.a_diff_model(noise, cond_emb)  # (B, out_dim)
+                else:
+                    dev = noise.device
+                    dummy_cond = torch.zeros(1, 77, 768, device=dev)
+                    a_flat = self.a_diff_model(noise[:1], dummy_cond)  # (1, out_dim)
+            a_all = a_flat.reshape(a_flat.shape[0], self.order, self.steps)
+            for i in range(1, self.order + 1):
+                self.solver.__setattr__(f"a{i}_diff", a_all[:, i - 1, :])
+
+        if self.c_parametrization != "diff":
+            out_dim = self.order * self.steps
+            if self.c_parametrization in ("linear", "mlp"):
+                if cond_emb is not None:
+                    x = cond_emb.mean(dim=1)
+                    c_flat = self.c_diff_model(x)  # (B, out_dim)
+                else:
+                    c_flat = self._c_bias.reshape(1, out_dim)
+            else:  # transformer
+                if cond_emb is not None:
+                    c_flat = self.c_diff_model(noise, cond_emb)  # (B, out_dim)
+                else:
+                    dev = noise.device
+                    dummy_cond = torch.zeros(1, 77, 768, device=dev)
+                    c_flat = self.c_diff_model(noise[:1], dummy_cond)  # (1, out_dim)
+            c_all = c_flat.reshape(c_flat.shape[0], self.order, self.steps)
+            for i in range(1, self.order + 1):
+                self.solver.__setattr__(f"c{i}_diff", c_all[:, i - 1, :])
 
     # timesteps logic
     def get_t_steps(self, noise=None, cond_emb=None, **kwargs) -> torch.Tensor:
@@ -223,6 +330,8 @@ class GSWrapper(nn.Module):
             None: A placeholder for consistency with latent models.
             torch.tensor: Sampled images
         """
+        cond_emb = getattr(self.model.model_fn, "condition", None)
+        self._update_dynamic_ac_coefs(noise=noise, cond_emb=cond_emb)
         images = self.solver.sample(
             x=noise,
             steps=self.steps,
@@ -323,6 +432,8 @@ class GSWrapperLatent(GSWrapper):
         images = None
         if condition is not None:
             self.model.set_condition(condition)
+        cond_emb = getattr(self.model.model_fn, "condition", None)
+        self._update_dynamic_ac_coefs(noise=noise, cond_emb=cond_emb)
         latents = self.solver.sample(
             x=noise,
             steps=self.steps,
