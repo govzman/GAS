@@ -44,12 +44,10 @@ for NFE in "${NFEs[@]}"
 do
 echo "Generate SD nfe=${NFE}"
 torchrun --standalone --nproc_per_node=1 generate.py \
-	--config=configs/sd/coco.yaml \
-	--outdir=data/teachers/sd-v1/nfe=${NFE} \
-	--seeds=00000-01449 \
-	--batch=4 \
-	--steps=${NFE} \
-	--create_dataset=True 
+    outdir="'data/teachers/sd-v1/nfe=${NFE}'" \
+    seeds="00000-01449" \
+    max_batch_size=4 \
+    create_dataset=True
 
 echo "Collate SD nfe=${NFE}"
 python collate.py \

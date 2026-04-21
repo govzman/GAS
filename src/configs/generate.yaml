@@ -1,0 +1,22 @@
+defaults:
+  - model: coco
+  - scheduler_model: scheduler_transformer
+  - writer: cometml
+  - datasets: coco
+  - student_solver: sd_student_default
+  - teacher_solver: sd_teacher_default
+
+loss_config:
+  loss_type: "GS"
+  loss_key: loss_l1_latents
+  disc_weight: 1
+  disc_type: latent_4
+  disc_lr: 0.00001
+
+# model: src/model/coco
+outdir: "data/teachers/sd-v1/nfe=5"
+seeds: "00000-01449"
+max_batch_size: 4
+checkpoint_path: null
+create_dataset: true
+device: cuda

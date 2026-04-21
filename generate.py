@@ -9,8 +9,8 @@ import torch
 import tqdm
 from omegaconf import DictConfig, OmegaConf
 
-from model.gas.models import get_gs_wrapper, load_base_model
-from model.gas.sampling_algs import SAMPLING_ALGS
+from src.model.gas.models import get_gs_wrapper, load_base_model
+from src.model.gas.sampling_algs import SAMPLING_ALGS
 from torch_utils import distributed as dist
 
 
@@ -69,17 +69,17 @@ def parse_int_list(s):
 # ----------------------------------------------------------------------------
 
 
-@hydra.main(version_base=None, config_path="conf", config_name="generate")
-def main(cfg: DictConfig):
-    cfg = OmegaConf.create(OmegaConf.to_container(cfg, resolve=True))
+@hydra.main(version_base=None, config_path="src/configs", config_name="generate")
+def main(config: DictConfig):
+    config = OmegaConf.create(OmegaConf.to_container(config, resolve=True))
 
-    outdir = cfg.outdir
-    seeds = parse_int_list(cfg.seeds)
-    max_batch_size = int(cfg.max_batch_size)
-    num_steps = cfg.num_steps
-    checkpoint_path = cfg.checkpoint_path
-    create_dataset = bool(cfg.create_dataset)
-    device = torch.device(cfg.device)
+    outdir = config.outdir
+    seeds = parse_int_list(config.seeds)
+    max_batch_size = int(config.max_batch_size)
+    # num_steps = config.num_steps
+    checkpoint_path = config.checkpoint_path
+    create_dataset = bool(config.create_dataset)
+    device = torch.device(config.device)
     dist.init()
 
     num_batches = (
@@ -92,8 +92,6 @@ def main(cfg: DictConfig):
     if dist.get_rank() != 0:
         torch.distributed.barrier()
 
-    config = cfg.config
-
     if create_dataset:
         synt_dir = os.path.join(outdir, "dataset")
         os.makedirs(synt_dir, exist_ok=True)
@@ -105,12 +103,13 @@ def main(cfg: DictConfig):
     gs_solver = checkpoint_path is not None
     model_config = config.model
     solver_config = (
-        config.student_solver_config if gs_solver else config.teacher_solver_config
+        config.student_solver if gs_solver else config.teacher_solver
     )
-
-    assert (num_steps is None) != (
-        solver_config.steps is None
-    ), "Students steps should be specified in one and only one of both generate script and solver config"
+    
+    num_steps = solver_config.steps # !
+    # assert (num_steps is None) != (
+    #     solver_config.steps is None
+    # ), "Students steps should be specified in one and only one of both generate script and solver config"
 
     # Load base model.
     model_config.t_eps = solver_config.t_eps
@@ -120,11 +119,11 @@ def main(cfg: DictConfig):
 
     # Generating using GS checkpoint.
     if gs_solver:
-        solver_config.loss_config.loss_type = "GS"
+        config.loss_config.loss_type = "GS"
         solver_config.steps = num_steps
         solver_config.order = num_steps
 
-        gs_wrapper = get_gs_wrapper(model, solver_config)
+        gs_wrapper = get_gs_wrapper(model, config)
         gs_wrapper.load_checkpoint(checkpoint_path=checkpoint_path)
         sampler_fn = partial(gs_wrapper.student_sampler_fn, decode=True)
 
