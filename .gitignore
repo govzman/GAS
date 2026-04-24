@@ -180,3 +180,4 @@ all-scripts/
 .cometml-runs/
 myenv/
 outputs/
+core*

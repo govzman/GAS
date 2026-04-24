@@ -21,10 +21,8 @@ class MLP(nn.Module):
             mlps.append(nn.Sequential(
                 nn.Linear(hidden_dim, hidden_dim)
             ))
-        mlps.append(nn.Linear(hidden_dim, num_timesteps - 1))
+        mlps.append(nn.Linear(hidden_dim, num_timesteps))
         self.mlps = nn.Sequential(*mlps)
 
-        self.softplus = nn.Softplus()
-
     def forward(self, x):
-        return self.softplus(self.mlps(x)) + 1e-3
+        return self.mlps(x)

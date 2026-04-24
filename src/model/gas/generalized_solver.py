@@ -30,19 +30,27 @@ class GeneralizedSolver:
         """
         Get time-step dependent parameter for the current solver step.
 
-        Supports both:
-        - 1D tensors of shape (steps,)
-        - 2D tensors of shape (B, steps) for per-sample conditioning
+        Supports:
+        - (steps,)
+        - (B, steps)
+        Applies residual scaling if enabled.
         """
+
         p = self.__getattribute__(name)
+
+        # select step
         if isinstance(p, torch.Tensor) and p.ndim == 2:
-            # (B, steps) -> (B,)
-            p = p[:, self.params_step]
+            p = p[:, self.params_step]     # (B,)
         else:
-            # (steps,) -> scalar
-            p = p[self.params_step]
+            p = p[self.params_step]        # scalar
+
+        # optional residual scaling
+        if hasattr(self, "coeff_residual_scale"):
+            p = self.coeff_residual_scale * p
+
         if ref is not None:
             p = self._match_coeff_shape(p, ref)
+
         return p
 
     @staticmethod

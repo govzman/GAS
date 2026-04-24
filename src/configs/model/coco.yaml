@@ -1,7 +1,7 @@
 path: src/configs/model/v1-inference.yaml
 type: SD
 conditional: true
-t_eps: null
+t_eps: 0.001
 guidance_scale: null
 prompts_path: data/coco_captions.txt
 

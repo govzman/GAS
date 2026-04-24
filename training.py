@@ -21,6 +21,7 @@ def train(
     ema: ExponentialMovingAverage,
     data: SyntDataset,
     optim: torch.optim.Adam,
+    optim_a_params: torch.optim.Adam,
     device: torch.device,
     accelerator: Optional[object] = None,
 ):
@@ -31,9 +32,14 @@ def train(
     if accelerator is not None:
         is_main = bool(getattr(accelerator, "is_main_process", True))
         device = getattr(accelerator, "device", device)
-
-        gs_wrapper, optim, data.train_loader, data.test_loader = accelerator.prepare(
-            gs_wrapper, optim, data.train_loader, data.test_loader
+            
+        if optim:
+            optim = accelerator.prepare(optim)
+        if optim_a_params:
+            optim_a_params = accelerator.prepare(optim_a_params)
+        
+        gs_wrapper, data.train_loader, data.test_loader = accelerator.prepare(
+            gs_wrapper, data.train_loader, data.test_loader
         )
 
     if is_main:
@@ -88,9 +94,13 @@ def train(
                         log_grads(exp=exp, model=gs_wrapper, global_step=global_step)
 
                     grad_norm = torch.nn.utils.clip_grad_norm_(gs_wrapper.parameters(), 1.0)
-
-                    optim.step()
-                    optim.zero_grad()
+                    
+                    if optim:
+                        optim.step()
+                        optim.zero_grad()
+                    if optim_a_params:
+                        optim_a_params.step()
+                        optim_a_params.zero_grad()
                     ema.update(gs_wrapper.parameters())
 
                     if exp is not None and global_step % config.writer.log_weights_freq == 0:
@@ -98,7 +108,10 @@ def train(
                         log_weights(exp, model=gs_wrapper, global_step=global_step)
 
                     log_d["optim/grad_norm"] = grad_norm
-                    log_d["optim/lr"] = optim.param_groups[0]["lr"]
+                    if optim:
+                        log_d["optim/lr"] = optim.param_groups[0]["lr"]
+                    if optim_a_params:
+                        log_d["optim_a_params/lr"] = optim_a_params.param_groups[0]["lr"]
             else:
                 with accelerator.accumulate(gs_wrapper):
                     with accelerator.autocast():
@@ -114,8 +127,12 @@ def train(
 
                         grad_norm = accelerator.clip_grad_norm_(gs_wrapper.parameters(), 1.0)
 
-                        optim.step()
-                        optim.zero_grad(set_to_none=True)
+                        if optim:
+                            optim.step()
+                            optim.zero_grad()
+                        if optim_a_params:
+                            optim_a_params.step()
+                            optim_a_params.zero_grad()
                         ema.update(gs_wrapper.parameters())
 
                         if exp is not None and global_step % config.writer.log_weights_freq == 0:
@@ -123,7 +140,10 @@ def train(
                             log_weights(exp, model=gs_wrapper, global_step=global_step)
 
                         log_d["optim/grad_norm"] = float(grad_norm)
-                        log_d["optim/lr"] = optim.param_groups[0]["lr"]
+                        if optim:
+                            log_d["optim/lr"] = optim.param_groups[0]["lr"]
+                        if optim_a_params:
+                            log_d["optim_a_params/lr"] = optim_a_params.param_groups[0]["lr"]
 
             for k, v in res_d.items():
                 if k not in NOT_LOG_KEYS:
@@ -168,13 +188,16 @@ def train(
                 model_to_save = gs_wrapper
                 if accelerator is not None:
                     model_to_save = accelerator.unwrap_model(gs_wrapper)
-
+            
                 ckpt = {
                     "ema": ema.state_dict(),
                     "model": model_to_save.state_dict(),
-                    "optim": optim.state_dict(),
                     "step": global_step,
                 }
+                if optim:
+                    ckpt["optim"] = optim.state_dict()
+                if optim_a_params:
+                    ckpt["optim_a_params"] = optim_a_params.state_dict()
                 ckpt_path = os.path.join(dir, f"{global_step}.pt")
                 if accelerator is not None:
                     accelerator.save(ckpt, ckpt_path)

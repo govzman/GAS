@@ -19,6 +19,29 @@ def _resolve_device(device_cfg: str) -> torch.device:
     return torch.device(device_cfg)
 
 
+def split_parameters(gs_wrapper):
+    a_params = []
+    other_params = []
+
+    for name, p in gs_wrapper.named_parameters():
+        if not p.requires_grad:
+            print('not require grad!', name)
+            continue
+
+        # a conditional model
+        # if name.startswith("a_diff_model") or name.startswith("_a_bias"):
+        if name.startswith("a") or name.startswith("_a"):
+            a_params.append(p)
+            print('a_params:', name)
+        else:
+            other_params.append(p)
+            print('other_params:', name)
+
+    print("A params:", len(a_params))
+    print("Other params:", len(other_params))
+    return a_params, other_params
+
+
 @hydra.main(version_base=None, config_path="src/configs", config_name="config")
 def main(config: DictConfig) -> None:
     # Freeze/resolve interpolations early (and make cfg printable).
@@ -66,7 +89,9 @@ def main(config: DictConfig) -> None:
     gs_wrapper = get_gs_wrapper(base_model, config)
 
     # Setup training
-    optim = instantiate(config.optimizer, params=gs_wrapper.parameters())
+    a_params, other_params = split_parameters(gs_wrapper)
+    optim = instantiate(config.optimizer, params=other_params) if other_params else None
+    optim_a_params = instantiate(config.optimizer_a_params, params=a_params) if a_params else None
     
     ema = ExponentialMovingAverage(gs_wrapper.parameters(), decay=config.trainer.ema_decay)
     n_iters = config.trainer.n_iters
@@ -80,6 +105,7 @@ def main(config: DictConfig) -> None:
         ema=ema,
         data=data,
         optim=optim,
+        optim_a_params=optim_a_params,
         device=device,
         accelerator=accelerator,
     )

@@ -66,7 +66,7 @@ class GSWrapper(nn.Module):
         # init t steps
         self.eps_mu_offset = 1e-5
         if self.solver_config.t_parametrization == "mu_logit":
-            self.mu_logit = nn.Parameter(torch.ones(self.steps - 1), requires_grad=True)
+            self.mu_logit = nn.Parameter(torch.ones(self.steps - 1), requires_grad=self.solver_config.t_requires_grad)
             t_unif = torch.linspace(1., self.t_eps, self.steps + 1).flip(0)
             self.mu_logit.data = self.get_inv_t_steps(t_unif)
         elif self.solver_config.t_parametrization == "linear":
@@ -114,12 +114,17 @@ class GSWrapper(nn.Module):
             elif self.a_parametrization == "mlp":
                 self.a_diff_model = nn.Sequential(
                     nn.Linear(in_features=768, out_features=768 * 4, bias=False),
+                    nn.LayerNorm(768 * 4),
+                    nn.LeakyReLU(),
+                    nn.Linear(in_features=768 * 4, out_features=768 * 4, bias=False),
+                    nn.LayerNorm(768 * 4),
                     nn.LeakyReLU(),
                     nn.Linear(in_features=768 * 4, out_features=out_dim),
                 )
-                nn.init.kaiming_uniform_(self.a_diff_model[0].weight, a=0.2)
-                nn.init.zeros_(self.a_diff_model[2].weight)
-                nn.init.zeros_(self.a_diff_model[2].bias)
+                nn.init.kaiming_uniform_(self.a_diff_model[0].weight, a=0.1)
+                nn.init.kaiming_uniform_(self.a_diff_model[3].weight, a=0.1)
+                nn.init.xavier_uniform_(self.a_diff_model[6].weight)  # или normal(0, 0.01)
+                nn.init.zeros_(self.a_diff_model[6].bias)
             elif self.a_parametrization == "transformer":
                 a_cfg = getattr(config, "a_scheduler_model", None)
                 if a_cfg is None:
@@ -139,12 +144,17 @@ class GSWrapper(nn.Module):
             elif self.c_parametrization == "mlp":
                 self.c_diff_model = nn.Sequential(
                     nn.Linear(in_features=768, out_features=768 * 4, bias=False),
+                    nn.LayerNorm(768 * 4),
+                    nn.LeakyReLU(),
+                    nn.Linear(in_features=768 * 4, out_features=768 * 4, bias=False),
+                    nn.LayerNorm(768 * 4),
                     nn.LeakyReLU(),
                     nn.Linear(in_features=768 * 4, out_features=out_dim),
                 )
                 nn.init.kaiming_uniform_(self.c_diff_model[0].weight, a=0.2)
-                nn.init.zeros_(self.c_diff_model[2].weight)
-                nn.init.zeros_(self.c_diff_model[2].bias)
+                nn.init.kaiming_uniform_(self.c_diff_model[3].weight, a=0.2)
+                nn.init.zeros_(self.c_diff_model[6].weight)
+                nn.init.zeros_(self.c_diff_model[6].bias)
             elif self.c_parametrization == "transformer":
                 c_cfg = getattr(config, "c_scheduler_model", None)
                 if c_cfg is None:
@@ -155,26 +165,39 @@ class GSWrapper(nn.Module):
             self._c_bias = nn.Parameter(torch.zeros(self.order, self.steps), requires_grad=self.solver_config.c_requires_grad)
 
         # baseline coefficients (current behavior)
-        if self.a_parametrization == "diff" and self.c_parametrization == "diff":
+        # ====== A coefficients ======
+        if self.a_parametrization == "diff":
             for i in range(1, self.order + 1):
-                cname, aname = f'c{i}_diff', f'a{i}_diff'
-
+                aname = f'a{i}_diff'
                 self.register_parameter(
-                    param=nn.Parameter(torch.zeros(self.steps), requires_grad=self.solver_config.c_requires_grad),
-                    name=cname
+                    name=aname,
+                    param=nn.Parameter(
+                        torch.zeros(self.steps),
+                        requires_grad=self.solver_config.a_requires_grad
+                    )
                 )
-                self.register_parameter(
-                    param=nn.Parameter(torch.zeros(self.steps), requires_grad=self.solver_config.a_requires_grad),
-                    name=aname
-                )
-
-                solver.__setattr__(cname, self.__getattr__(cname))
                 solver.__setattr__(aname, self.__getattr__(aname))
         else:
-            # placeholders; actual tensors are set per sampling call
+            # placeholder, будет заменён батчевыми coeffs
+            for i in range(1, self.order + 1):
+                solver.__setattr__(f'a{i}_diff', torch.zeros(self.steps))
+
+
+        # ====== C coefficients ======
+        if self.c_parametrization == "diff":
+            for i in range(1, self.order + 1):
+                cname = f'c{i}_diff'
+                self.register_parameter(
+                    name=cname,
+                    param=nn.Parameter(
+                        torch.zeros(self.steps),
+                        requires_grad=self.solver_config.c_requires_grad
+                    )
+                )
+                solver.__setattr__(cname, self.__getattr__(cname))
+        else:
             for i in range(1, self.order + 1):
                 solver.__setattr__(f'c{i}_diff', torch.zeros(self.steps))
-                solver.__setattr__(f'a{i}_diff', torch.zeros(self.steps))
 
         # theory coef
         solver.use_theory_coef = self.solver_config.use_theory_coef
@@ -184,6 +207,62 @@ class GSWrapper(nn.Module):
                 order=self.order,
                 timesteps=self.get_t_steps()
             )
+        
+        # ==========================================
+        # Apply requires_grad flags consistently
+        # ==========================================
+
+        def set_requires_grad(module, flag: bool):
+            if module is None:
+                return
+            for p in module.parameters():
+                p.requires_grad = flag
+
+        # ---- A parameters ----
+        if self.a_parametrization == "diff":
+            # diff params already created with requires_grad flag
+            pass
+        else:
+            # control conditional model
+            set_requires_grad(self.a_diff_model, self.solver_config.a_requires_grad)
+            if self._a_bias is not None:
+                self._a_bias.requires_grad = self.solver_config.a_requires_grad
+
+
+        # ---- C parameters ----
+        if self.c_parametrization == "diff":
+            pass
+        else:
+            set_requires_grad(self.c_diff_model, self.solver_config.c_requires_grad)
+            if self._c_bias is not None:
+                self._c_bias.requires_grad = self.solver_config.c_requires_grad
+        
+        # ==========================================
+        # Residual initialization for conditional a/c
+        # ==========================================
+
+        self.coeff_residual_scale = 0.01  # маленькая амплитуда
+
+        def zero_last_layer(module):
+            if isinstance(module, nn.Sequential):
+                last = module[-1]
+                if isinstance(last, nn.Linear):
+                    nn.init.zeros_(last.weight)
+                    if last.bias is not None:
+                        nn.init.zeros_(last.bias)
+            elif isinstance(module, nn.Linear):
+                nn.init.zeros_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+
+        # A model
+        if self.a_diff_model is not None:
+            zero_last_layer(self.a_diff_model)
+
+        # C model
+        if self.c_diff_model is not None:
+            zero_last_layer(self.c_diff_model)
+        
         # end init solver
         self.solver = solver
 
@@ -206,10 +285,13 @@ class GSWrapper(nn.Module):
                 else:
                     dev = noise.device
                     dummy_cond = torch.zeros(1, 77, 768, device=dev)
-                    a_flat = self.a_diff_model(noise[:1], dummy_cond)  # (1, out_dim)
+                    a_flat = self.a_diff_model(noise, dummy_cond)  # (1, out_dim)
             a_all = a_flat.reshape(a_flat.shape[0], self.order, self.steps)
+            
             for i in range(1, self.order + 1):
                 self.solver.__setattr__(f"a{i}_diff", a_all[:, i - 1, :])
+                print(f"a{i}_diff", a_all[:, i - 1, :])
+            print()
 
         if self.c_parametrization != "diff":
             out_dim = self.order * self.steps
@@ -225,8 +307,9 @@ class GSWrapper(nn.Module):
                 else:
                     dev = noise.device
                     dummy_cond = torch.zeros(1, 77, 768, device=dev)
-                    c_flat = self.c_diff_model(noise[:1], dummy_cond)  # (1, out_dim)
+                    c_flat = self.c_diff_model(noise, dummy_cond)  # (1, out_dim)
             c_all = c_flat.reshape(c_flat.shape[0], self.order, self.steps)
+            c_all = 10 * torch.tanh(c_all) # IMPORTANT
             for i in range(1, self.order + 1):
                 self.solver.__setattr__(f"c{i}_diff", c_all[:, i - 1, :])
 
@@ -258,7 +341,7 @@ class GSWrapper(nn.Module):
             if cond_emb is not None:
                 logits = self.mu_logit(noise, cond_emb).T
             else:
-                logits = self.mu_logit(noise[:1], torch.zeros(1, 77, 768).to('cuda'))[0].T # noise.shape[0], 
+                logits = self.mu_logit(noise, torch.zeros(1, 77, 768).to('cuda'))[0].T # noise.shape[0], 
                 
         t = self.get_mu_t_steps(logits)
         return t.flip(0)
@@ -301,9 +384,9 @@ class GSWrapper(nn.Module):
         ema.load_state_dict(checkpoint['ema'])
         ema.copy_to(self.parameters())
 
-    def parameters(self) -> List[nn.parameter.Parameter]:
-        """Returns list of specified solver and wrapper parameters."""
-        return list(p for p in super().parameters() if p.requires_grad)
+    # def parameters(self) -> List[nn.parameter.Parameter]:
+    #     """Returns list of specified solver and wrapper parameters."""
+    #     return list(p for p in super().parameters() if p.requires_grad)
 
     def interpolate_lpips(self, x: torch.Tensor) -> torch.Tensor:
         """Utility function to resize images for LPIPS calculation."""
