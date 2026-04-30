@@ -131,18 +131,25 @@ class GSWrapper(nn.Module):
 
         # init t steps
         self.eps_mu_offset = 1e-5
-        if self.solver_config.t_parametrization == "mu_logit":
+        # support both new and legacy config key names
+        self.t_parametrization = getattr(
+            self.solver_config,
+            "t_parametrization",
+            getattr(self.solver_config, "t_schedule_parametrization", "diff"),
+        )
+
+        if self.t_parametrization in ("diff", "mu_logit"):
             self.mu_logit = nn.Parameter(torch.ones(self.steps - 1), requires_grad=self.solver_config.t_requires_grad)
             t_unif = torch.linspace(1., self.t_eps, self.steps + 1).flip(0)
             self.mu_logit.data = self.get_inv_t_steps(t_unif)
-        elif self.solver_config.t_parametrization == "linear":
+        elif self.t_parametrization == "linear":
             self.mu_logit = nn.Linear(in_features=768, out_features=self.steps - 1)
             nn.init.normal_(self.mu_logit.weight, std=0.02)
             # nn.init.kaiming_uniform_(self.mu_logit.weight, a=0.1)
             t_unif = torch.linspace(1., self.t_eps, self.steps + 1).flip(0)
             with torch.no_grad():
                 self.mu_logit.bias.copy_(self.get_inv_t_steps(t_unif))
-        elif self.solver_config.t_parametrization == "mlp":
+        elif self.t_parametrization == "mlp":
             self.mu_logit = nn.Sequential(
                 nn.Linear(in_features=768, out_features=768 * 4, bias=False),
                 nn.LeakyReLU(),
@@ -153,13 +160,52 @@ class GSWrapper(nn.Module):
             t_unif = torch.linspace(1., self.t_eps, self.steps + 1).flip(0)
             with torch.no_grad():
                 self.mu_logit[2].bias.copy_(self.get_inv_t_steps(t_unif))
-        elif self.solver_config.t_parametrization == "transformer":
+        elif self.t_parametrization in ("film_mlp", "prompt_noise_film_mlp"):
+            hidden_dim = int(getattr(self.solver_config, "t_film_hidden_dim", 256))
+            self.mu_logit = PromptNoiseFiLMMlp(out_dim=self.steps - 1, hidden_dim=hidden_dim)
+        elif self.t_parametrization == "transformer":
             self.mu_logit = instantiate(config.scheduler_model)
+        else:
+            raise ValueError(f"Unsupported t_parametrization={self.t_parametrization}")
 
         solver.get_time_steps = lambda *args, **kwargs: self.get_t_steps(*args, **kwargs)
 
         # init t_couple
-        self.t_couple = nn.Parameter(torch.zeros(self.steps), requires_grad=self.solver_config.t_couple_requires_grad)
+        self.t_couple_parametrization = getattr(self.solver_config, "t_couple_parametrization", "diff")
+        self.t_couple_model = None
+        self._t_couple_bias = None
+
+        if self.t_couple_parametrization == "diff":
+            self.t_couple = nn.Parameter(torch.zeros(self.steps), requires_grad=self.solver_config.t_couple_requires_grad)
+        else:
+            if self.t_couple_parametrization == "linear":
+                self.t_couple_model = nn.Linear(in_features=768, out_features=self.steps)
+                nn.init.normal_(self.t_couple_model.weight, std=0.02)
+                nn.init.zeros_(self.t_couple_model.bias)
+            elif self.t_couple_parametrization == "mlp":
+                self.t_couple_model = nn.Sequential(
+                    nn.Linear(in_features=768, out_features=768 * 4, bias=False),
+                    nn.LayerNorm(768 * 4),
+                    nn.LeakyReLU(),
+                    nn.Linear(in_features=768 * 4, out_features=768 * 4, bias=False),
+                    nn.LayerNorm(768 * 4),
+                    nn.LeakyReLU(),
+                    nn.Linear(in_features=768 * 4, out_features=self.steps),
+                )
+                nn.init.kaiming_uniform_(self.t_couple_model[0].weight, a=0.2)
+                nn.init.kaiming_uniform_(self.t_couple_model[3].weight, a=0.2)
+                nn.init.zeros_(self.t_couple_model[6].weight)
+                nn.init.zeros_(self.t_couple_model[6].bias)
+            elif self.t_couple_parametrization in ("film_mlp", "prompt_noise_film_mlp"):
+                hidden_dim = int(getattr(self.solver_config, "t_couple_film_hidden_dim", 256))
+                self.t_couple_model = PromptNoiseFiLMMlp(out_dim=self.steps, hidden_dim=hidden_dim)
+            else:
+                raise ValueError(f"Unsupported t_couple_parametrization={self.t_couple_parametrization}")
+
+            self._t_couple_bias = nn.Parameter(torch.zeros(self.steps), requires_grad=self.solver_config.t_couple_requires_grad)
+            # placeholder (will be replaced per-batch)
+            self.t_couple = torch.zeros(self.steps)
+
         solver.t_couple = self.t_couple
 
         # init coef (a/c) parametrizations
@@ -225,7 +271,7 @@ class GSWrapper(nn.Module):
                 nn.init.kaiming_uniform_(self.c_diff_model[3].weight, a=0.2)
                 nn.init.zeros_(self.c_diff_model[6].weight)
                 nn.init.zeros_(self.c_diff_model[6].bias)
-            elif self.a_parametrization in ("film_mlp", "prompt_noise_film_mlp"):
+            elif self.c_parametrization in ("film_mlp", "prompt_noise_film_mlp"):
                 # conditional on both prompt + initial noise statistics
                 hidden_dim = int(getattr(self.solver_config, "c_film_hidden_dim", 256))
                 self.c_diff_model = PromptNoiseFiLMMlp(out_dim=out_dim, hidden_dim=hidden_dim)
@@ -310,6 +356,14 @@ class GSWrapper(nn.Module):
             set_requires_grad(self.c_diff_model, self.solver_config.c_requires_grad)
             if self._c_bias is not None:
                 self._c_bias.requires_grad = self.solver_config.c_requires_grad
+
+        # ---- t_couple parameters ----
+        if self.t_couple_parametrization == "diff":
+            pass
+        else:
+            set_requires_grad(self.t_couple_model, self.solver_config.t_couple_requires_grad)
+            if self._t_couple_bias is not None:
+                self._t_couple_bias.requires_grad = self.solver_config.t_couple_requires_grad
         
         # ==========================================
         # Residual initialization for conditional a/c
@@ -340,6 +394,24 @@ class GSWrapper(nn.Module):
         # end init solver
         self.solver = solver
 
+    def _update_dynamic_t_couple(self, noise: torch.Tensor, cond_emb: Optional[torch.Tensor]) -> None:
+        if self.t_couple_parametrization == "diff":
+            return
+
+        if self.t_couple_parametrization in ("linear", "mlp"):
+            if cond_emb is not None:
+                x = cond_emb.mean(dim=1)
+                t_couple = self.t_couple_model(x)  # (B, steps)
+            else:
+                t_couple = self._t_couple_bias.reshape(1, self.steps)
+        else:  # film_mlp | prompt_noise_film_mlp
+            if cond_emb is not None:
+                t_couple = self.t_couple_model(noise, cond_emb)  # (B, steps)
+            else:
+                t_couple = self._t_couple_bias.reshape(1, self.steps)
+
+        self.solver.t_couple = t_couple
+
     def _update_dynamic_ac_coefs(self, noise: torch.Tensor, cond_emb: Optional[torch.Tensor]) -> None:
         """
         If enabled by config, compute batch-dependent a/c coefficient tables and
@@ -369,8 +441,6 @@ class GSWrapper(nn.Module):
             
             for i in range(1, self.order + 1):
                 self.solver.__setattr__(f"a{i}_diff", a_all[:, i - 1, :])
-                print(f"a{i}_diff", a_all[:, i - 1, :])
-            print()
 
         if self.c_parametrization != "diff":
             out_dim = self.order * self.steps
@@ -396,16 +466,13 @@ class GSWrapper(nn.Module):
             
             for i in range(1, self.order + 1):
                 self.solver.__setattr__(f"c{i}_diff", c_all[:, i - 1, :])
-                print(f"c{i}_diff", c_all[:, i - 1, :])
-            print()
             
     # timesteps logic
     def get_t_steps(self, noise=None, cond_emb=None, **kwargs) -> torch.Tensor:
         """Get generation timesteps."""
-        if self.solver_config.t_parametrization == "mu_logit":
+        if self.t_parametrization in ("diff", "mu_logit"):
             logits = self.mu_logit
-            print('//', logits.shape)
-        elif self.solver_config.t_parametrization == "linear":
+        elif self.t_parametrization == "linear":
             if cond_emb is not None:
                 # B = cond_emb.shape[0]
                 if torch.isnan(self.mu_logit.weight).any():
@@ -414,22 +481,30 @@ class GSWrapper(nn.Module):
                     print(f"⚠️ NaN в mu_logit.bias!")
                 cond_emb = cond_emb.mean(dim=1)
 		        # cond_emb = cond_emb / cond_emb.norm(dim=-1, keepdim=True)
-                logits = self.mu_logit(cond_emb).T
+                logits = self.mu_logit(cond_emb)
 		        # logits = self.mu_logit(cond_emb.reshape(B, -1)).T
             else:
                 logits = self.mu_logit.bias
-        elif self.solver_config.t_parametrization == "mlp":
+        elif self.t_parametrization == "mlp":
             if cond_emb is not None:
-                logits = self.mu_logit(cond_emb)[:, 0, :].T
+                logits = self.mu_logit(cond_emb)[:, 0, :]
             else:
                 logits = self.mu_logit[2].bias
-        elif self.solver_config.t_parametrization == "transformer":
+        elif self.t_parametrization in ("film_mlp", "prompt_noise_film_mlp"):
             if cond_emb is not None:
-                logits = self.mu_logit(noise, cond_emb).T
+                logits = self.mu_logit(noise, cond_emb)  # (B, steps-1)
             else:
-                logits = self.mu_logit(noise, torch.zeros(1, 77, 768).to('cuda'))[0].T # noise.shape[0], 
+                logits = torch.zeros(1, self.steps - 1, device=noise.device, dtype=noise.dtype)
+        elif self.t_parametrization == "transformer":
+            if cond_emb is not None:
+                logits = self.mu_logit(noise, cond_emb)
+            else:
+                logits = self.mu_logit(noise, torch.zeros(1, 77, 768, device=noise.device, dtype=noise.dtype))[0]
                 
         t = self.get_mu_t_steps(logits)
+        # keep the same direction as before
+        if t.ndim == 2:
+            return t.flip(1)
         return t.flip(0)
     
     def get_mu_t_steps(self, mu_logit: torch.Tensor) -> torch.Tensor:
@@ -440,6 +515,20 @@ class GSWrapper(nn.Module):
 
         mu = mu_logit.sigmoid()
         mu = mu * (1 - 2 * self.eps_mu_offset) + self.eps_mu_offset
+
+        if mu.ndim == 2:
+            # (B, steps-1) -> cumprod over step dimension
+            t_steps = 1 - torch.cumprod(mu, dim=1)
+            t_steps = t_steps * (1 - t_offset) + t_offset
+            t_steps = torch.cat(
+                [
+                    torch.zeros_like(t_steps[:, :1]) + t_offset,
+                    t_steps,
+                    torch.ones_like(t_steps[:, :1]),
+                ],
+                dim=1,
+            )
+            return t_steps
 
         t_steps = 1 - torch.cumprod(mu, 0)
         t_steps = t_steps * (1 - t_offset) + t_offset
@@ -500,6 +589,7 @@ class GSWrapper(nn.Module):
             torch.tensor: Sampled images
         """
         cond_emb = getattr(self.model.model_fn, "condition", None)
+        self._update_dynamic_t_couple(noise=noise, cond_emb=cond_emb)
         self._update_dynamic_ac_coefs(noise=noise, cond_emb=cond_emb)
         images = self.solver.sample(
             x=noise,
@@ -602,6 +692,7 @@ class GSWrapperLatent(GSWrapper):
         if condition is not None:
             self.model.set_condition(condition)
         cond_emb = getattr(self.model.model_fn, "condition", None)
+        self._update_dynamic_t_couple(noise=noise, cond_emb=cond_emb)
         self._update_dynamic_ac_coefs(noise=noise, cond_emb=cond_emb)
         latents = self.solver.sample(
             x=noise,

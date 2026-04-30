@@ -1,10 +1,17 @@
 steps: 4
 order: 3
 t_eps: 0.001
-t_couple_parametrization: diff   # diff | linear | mlp | film_mlp
-t_schedule_parametrization: diff # diff | linear | mlp | film_mlp
-a_parametrization: diff # diff | linear | mlp | transformer
-c_parametrization: diff # diff | linear | mlp | transformer
+t_couple_parametrization: film_mlp   # diff | linear | mlp | film_mlp | prompt_noise_film_mlp
+t_couple_film_hidden_dim: 256
+
+# Backward/forward compatible with code:
+# - legacy key: t_schedule_parametrization
+# - new key:    t_parametrization
+t_parametrization: film_mlp          # diff | linear | mlp | transformer | film_mlp | prompt_noise_film_mlp
+t_schedule_parametrization: film_mlp # kept for older configs
+t_film_hidden_dim: 256
+a_parametrization: film_mlp # diff | linear | mlp | transformer
+c_parametrization: film_mlp # diff | linear | mlp | transformer
 use_theory_coef: true
 guidance_scale: 7.5
 t_requires_grad: true

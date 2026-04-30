@@ -70,7 +70,9 @@ class GeneralizedSolver:
         Returns:
             torch.Tensor: Output of data prediction.
         """
-        noise = self.model_class(x, t + self.t_couple[self.params_step])
+        # t_couple can be either (steps,) or (B, steps) for conditional parametrizations
+        t = t + self._get_step_param("t_couple", ref=t)
+        noise = self.model_class(x, t)
         alpha_t, sigma_t = self.noise_schedule.marginal_alpha(t), self.noise_schedule.marginal_std(t)
         alpha_t = self._match_coeff_shape(alpha_t, x)
         sigma_t = self._match_coeff_shape(sigma_t, x)
@@ -429,8 +431,12 @@ class GeneralizedSolver:
         # Init the initial values.
         cond_emb = self.model_class.condition
         timesteps = self.get_time_steps(x, cond_emb)
-        assert timesteps.shape[0] - 1 == steps, f"timestep.shape = {timesteps.shape}"
-        t = timesteps[0]
+        if timesteps.ndim == 2:
+            assert timesteps.shape[1] - 1 == steps, f"timestep.shape = {timesteps.shape}"
+            t = timesteps[:, 0]
+        else:
+            assert timesteps.shape[0] - 1 == steps, f"timestep.shape = {timesteps.shape}"
+            t = timesteps[0]
         t_prev_list = [t]
 
         
@@ -438,7 +444,7 @@ class GeneralizedSolver:
         x_prev_list = [x]
 
         for step in range(1, steps + 1):
-            t = timesteps[step]
+            t = timesteps[:, step] if timesteps.ndim == 2 else timesteps[step]
             cur_order = min(step, order)
             x = self.solver_update(x, model_prev_list, t_prev_list, t, order=cur_order, x_prev_list=x_prev_list)
 
