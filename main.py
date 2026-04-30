@@ -30,7 +30,7 @@ def split_parameters(gs_wrapper):
 
         # a conditional model
         # if name.startswith("a_diff_model") or name.startswith("_a_bias"):
-        if name.startswith("a") or name.startswith("_a"):
+        if name.startswith("a") or name.startswith("_a") or name.startswith("c") or name.startswith("_c"):
             a_params.append(p)
             print('a_params:', name)
         else:

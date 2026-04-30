@@ -1,12 +1,13 @@
 steps: 4
 order: 3
 t_eps: 0.001
-t_parametrization: mu_logit # linear
+t_couple_parametrization: diff   # diff | linear | mlp | film_mlp
+t_schedule_parametrization: diff # diff | linear | mlp | film_mlp
 a_parametrization: diff # diff | linear | mlp | transformer
 c_parametrization: diff # diff | linear | mlp | transformer
 use_theory_coef: true
 guidance_scale: 7.5
-t_requires_grad: false
-t_couple_requires_grad: false
+t_requires_grad: true
+t_couple_requires_grad: true
 a_requires_grad: true
-c_requires_grad: false
+c_requires_grad: true

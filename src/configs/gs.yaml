@@ -27,8 +27,8 @@ trainer:
   epoch_num: 2500
   # Backward compatible: training.py used to read iters_to_accumulate directly.
   # With Accelerate we primarily use accumulation_steps.
-  iters_to_accumulate: 1
-  accumulation_steps: 1
+  iters_to_accumulate: 2
+  accumulation_steps: 2
   # accelerate mixed_precision expects: "no" | "fp16" | "bf16"
   amp: "no"
   ema_decay: 0.999

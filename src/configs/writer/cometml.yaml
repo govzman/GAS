@@ -1,6 +1,6 @@
 project_name: test_GAS
 eval_freq: 10
-checkpoint_freq: 10
+checkpoint_freq: 1000
 log_weights_freq: 10
 run_name: test_transformer
 mode: online

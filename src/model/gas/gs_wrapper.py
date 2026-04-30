@@ -13,6 +13,72 @@ from src.model.gas.generalized_solver import GeneralizedSolver
 from src.model.gas.adversarial_module.dist_adv_loss import DistAdversarialTraining
 from src.model.gas.synt_data import SyntDataType
 
+
+class PromptNoiseFiLMMlp(nn.Module):
+    """
+    Stable conditional MLP for coefficient tables that depends on both:
+    - prompt embedding (cond_emb): (B, T, 768)
+    - initial noise (noise): (B, C, H, W) or (B, ...)
+    Produces (B, out_dim) where out_dim = order * steps.
+    """
+
+    def __init__(self, out_dim: int, prompt_dim: int = 768, hidden_dim: int = 256, noise_feat_dim: int = 3):
+        super().__init__()
+        self.prompt_norm = nn.LayerNorm(prompt_dim)
+        self.noise_norm = nn.LayerNorm(noise_feat_dim)
+
+        self.prompt_mlp = nn.Sequential(
+            nn.Linear(prompt_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        self.noise_mlp = nn.Sequential(
+            nn.Linear(noise_feat_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+
+        # FiLM params from noise branch: gamma,beta for prompt features
+        self.film = nn.Linear(hidden_dim, 2 * hidden_dim)
+        nn.init.zeros_(self.film.weight)
+        nn.init.zeros_(self.film.bias)
+
+        self.out_norm = nn.LayerNorm(hidden_dim)
+        self.head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, out_dim),
+        )
+        # start from near-zero residuals (wrapper further scales residuals)
+        nn.init.zeros_(self.head[-1].weight)
+        nn.init.zeros_(self.head[-1].bias)
+
+    @staticmethod
+    def _noise_stats(noise: torch.Tensor) -> torch.Tensor:
+        # Robust low-dim summary of z0. Shape: (B, 3) = [mean, std, rms]
+        b = noise.shape[0]
+        flat = noise.reshape(b, -1)
+        mean = flat.mean(dim=1)
+        std = flat.std(dim=1, unbiased=False)
+        rms = (flat.pow(2).mean(dim=1) + 1e-12).sqrt()
+        return torch.stack([mean, std, rms], dim=1)
+
+    def forward(self, noise: torch.Tensor, cond_emb: torch.Tensor) -> torch.Tensor:
+        # cond_emb: (B, T, 768) -> pooled (B, 768)
+        p = cond_emb.mean(dim=1)
+        # p = self.prompt_norm(p)
+        hp = self.prompt_mlp(p)
+
+        n = self._noise_stats(noise).to(dtype=hp.dtype, device=hp.device)
+        # n = self.noise_norm(n)
+        hn = self.noise_mlp(n)
+
+        gamma, beta = self.film(hn).chunk(2, dim=1)
+        # h = self.out_norm(hp * (1.0 + gamma) + beta)
+        h = hp * (1.0 + gamma) + beta
+        return self.head(h)
+    
+
 class GSWrapper(nn.Module):
     """Generalised Solver wrapper. 
     
@@ -125,6 +191,10 @@ class GSWrapper(nn.Module):
                 nn.init.kaiming_uniform_(self.a_diff_model[3].weight, a=0.1)
                 nn.init.xavier_uniform_(self.a_diff_model[6].weight)  # или normal(0, 0.01)
                 nn.init.zeros_(self.a_diff_model[6].bias)
+            elif self.a_parametrization in ("film_mlp", "prompt_noise_film_mlp"):
+                # conditional on both prompt + initial noise statistics
+                hidden_dim = int(getattr(self.solver_config, "a_film_hidden_dim", 256))
+                self.a_diff_model = PromptNoiseFiLMMlp(out_dim=out_dim, hidden_dim=hidden_dim)
             elif self.a_parametrization == "transformer":
                 a_cfg = getattr(config, "a_scheduler_model", None)
                 if a_cfg is None:
@@ -155,6 +225,10 @@ class GSWrapper(nn.Module):
                 nn.init.kaiming_uniform_(self.c_diff_model[3].weight, a=0.2)
                 nn.init.zeros_(self.c_diff_model[6].weight)
                 nn.init.zeros_(self.c_diff_model[6].bias)
+            elif self.a_parametrization in ("film_mlp", "prompt_noise_film_mlp"):
+                # conditional on both prompt + initial noise statistics
+                hidden_dim = int(getattr(self.solver_config, "c_film_hidden_dim", 256))
+                self.c_diff_model = PromptNoiseFiLMMlp(out_dim=out_dim, hidden_dim=hidden_dim)
             elif self.c_parametrization == "transformer":
                 c_cfg = getattr(config, "c_scheduler_model", None)
                 if c_cfg is None:
@@ -279,6 +353,11 @@ class GSWrapper(nn.Module):
                     a_flat = self.a_diff_model(x)  # (B, out_dim)
                 else:
                     a_flat = self._a_bias.reshape(1, out_dim)
+            elif self.a_parametrization in ("film_mlp", "prompt_noise_film_mlp"):
+                if cond_emb is not None:
+                    a_flat = self.a_diff_model(noise, cond_emb)  # (B, out_dim)
+                else:
+                    a_flat = self._a_bias.reshape(1, out_dim)
             else:  # transformer
                 if cond_emb is not None:
                     a_flat = self.a_diff_model(noise, cond_emb)  # (B, out_dim)
@@ -301,6 +380,11 @@ class GSWrapper(nn.Module):
                     c_flat = self.c_diff_model(x)  # (B, out_dim)
                 else:
                     c_flat = self._c_bias.reshape(1, out_dim)
+            elif self.c_parametrization in ("film_mlp", "prompt_noise_film_mlp"):
+                if cond_emb is not None:
+                    c_flat = self.c_diff_model(noise, cond_emb)  # (B, out_dim)
+                else:
+                    c_flat = self._c_bias.reshape(1, out_dim)
             else:  # transformer
                 if cond_emb is not None:
                     c_flat = self.c_diff_model(noise, cond_emb)  # (B, out_dim)
@@ -309,10 +393,12 @@ class GSWrapper(nn.Module):
                     dummy_cond = torch.zeros(1, 77, 768, device=dev)
                     c_flat = self.c_diff_model(noise, dummy_cond)  # (1, out_dim)
             c_all = c_flat.reshape(c_flat.shape[0], self.order, self.steps)
-            c_all = 10 * torch.tanh(c_all) # IMPORTANT
+            
             for i in range(1, self.order + 1):
                 self.solver.__setattr__(f"c{i}_diff", c_all[:, i - 1, :])
-
+                print(f"c{i}_diff", c_all[:, i - 1, :])
+            print()
+            
     # timesteps logic
     def get_t_steps(self, noise=None, cond_emb=None, **kwargs) -> torch.Tensor:
         """Get generation timesteps."""
@@ -541,7 +627,7 @@ class GSWrapperLatent(GSWrapper):
             d['timesteps'] = self.solver.get_time_steps(noise, cond_emb)
             print(d['timesteps'])
             print(condition)
-            print(cond_emb)
+            # print(cond_emb)
         student_latents, _ = self.student_sampler_fn(
             noise,
             condition=condition
