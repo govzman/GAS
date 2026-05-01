@@ -620,7 +620,10 @@ class GSWrapper(nn.Module):
 
         d = {}
         if return_timesteps:
-            d['timesteps'] = self.solver.get_time_steps()
+            # For conditional t parametrizations (e.g. film_mlp), timesteps depend on cond_emb (+ noise),
+            # so pass them explicitly (same behavior as in GSWrapperLatent).
+            cond_emb = getattr(self.model.model_fn, "condition", None)
+            d['timesteps'] = self.solver.get_time_steps(noise, cond_emb)
         _, student_images = self.student_sampler_fn(noise)
 
         d['loss_l1'] = torch.abs(student_images - images).mean((1, 2, 3))

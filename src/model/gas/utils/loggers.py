@@ -23,15 +23,23 @@ def log_plt_fig(exp: comet_ml.Experiment, fig, key: str, global_step: int) -> No
 def log_t_steps_plot(
     exp: comet_ml.Experiment, t_steps: torch.Tensor, global_step: int = None, key: str = None
 ) -> None:
-    # Переносим на CPU и преобразуем в numpy
-    t_steps = t_steps.detach().cpu().numpy()
-    print('???', t_steps.shape)
-    print(t_steps)
+    t_steps = t_steps.detach().cpu()
 
-    # Если одномерный, делаем вид [steps, 1]
+    # Normalize shapes:
+    # - (S,) -> (S, 1)
+    # - (B, S) -> (S, B)
+    # - (S, B) -> (S, B)
     if t_steps.ndim == 1:
         t_steps = t_steps[:, None]
+    elif t_steps.ndim == 2:
+        # Heuristic: if first dim looks like batch (usually small) and second like steps (usually >= 2)
+        if t_steps.shape[0] < t_steps.shape[1]:
+            t_steps = t_steps.T
+    else:
+        # Unexpected, just flatten batch dims into one and keep steps dimension
+        t_steps = t_steps.reshape(t_steps.shape[0], -1)
 
+    t_steps = t_steps.numpy()
     steps, batch_size = t_steps.shape
 
     fig, ax = plt.subplots(1, 1, figsize=(4, 4))
@@ -129,16 +137,48 @@ def log_grads(exp: comet_ml.Experiment, model: GSWrapper, global_step: int) -> N
 
 @torch.no_grad()
 def log_t_steps(exp: comet_ml.Experiment, t_steps: torch.Tensor, global_step: int, key: str = "t_stats") -> None:
-    t_steps = t_steps.detach().clone().cpu()
-    
-    # Если тензор двумерный, берём первый элемент по batch_size
-    if t_steps.dim() == 2:
-        t_steps = t_steps[:, 0]          # shape: [steps]
-    
-    t_steps = t_steps.numpy()            # преобразуем в numpy для логирования
-    
+    """
+    Logs:
+    - Per-step stats across batch: mean/std/min/max
+    - A few individual trajectories (first K batch items)
+
+    Supports input shapes:
+    - (S,)
+    - (B, S)
+    - (S, B)
+    """
+    t_steps = t_steps.detach().float().cpu()
+
+    # Normalize shapes to (S, B)
+    if t_steps.ndim == 1:
+        t_steps = t_steps[:, None]
+    elif t_steps.ndim == 2:
+        if t_steps.shape[0] < t_steps.shape[1]:
+            # likely (B, S)
+            t_steps = t_steps.T
+    else:
+        # Keep first dim as steps, collapse the rest into batch
+        t_steps = t_steps.reshape(t_steps.shape[0], -1)
+
+    S, B = t_steps.shape
     d = {}
-    for i, t in enumerate(t_steps):
-        d[f"{key}/t_{i:02d}"] = t
-    
+
+    # Stats across batch
+    mean = t_steps.mean(dim=1)
+    std = t_steps.std(dim=1, unbiased=False)
+    tmin = t_steps.min(dim=1).values
+    tmax = t_steps.max(dim=1).values
+
+    for i in range(S):
+        d[f"{key}/t_{i:02d}_mean"] = float(mean[i])
+        d[f"{key}/t_{i:02d}_std"] = float(std[i])
+        d[f"{key}/t_{i:02d}_min"] = float(tmin[i])
+        d[f"{key}/t_{i:02d}_max"] = float(tmax[i])
+
+    # A few individual trajectories
+    k = min(3, B)
+    for b in range(k):
+        for i in range(S):
+            d[f"{key}/traj_{b:02d}/t_{i:02d}"] = float(t_steps[i, b])
+
     exp.log_metrics(d, step=global_step)
