@@ -14,6 +14,39 @@ from src.model.gas.adversarial_module.dist_adv_loss import DistAdversarialTraini
 from src.model.gas.synt_data import SyntDataType
 
 
+def _final_linear_scheduler_transformer(module: nn.Module) -> Optional[nn.Linear]:
+    """Последний `Linear` в голове `SchedulerTransformer`: `*.mlps.mlps[-1]` (вложенный MLP)."""
+    inner = getattr(module, "mlps", None)
+    if inner is None or not hasattr(inner, "mlps"):
+        return None
+    seq = inner.mlps
+    if not isinstance(seq, nn.Sequential) or len(seq) == 0:
+        return None
+    tail = seq[-1]
+    return tail if isinstance(tail, nn.Linear) else None
+
+
+def _init_scheduler_transformer_residual_head(
+    module: nn.Module,
+    logistic_bias_1d: Optional[torch.Tensor] = None,
+) -> None:
+    """
+    Вес последнего линейного слоя в нуль (остаток к теоретическим a/c или к нулевому сдвигу t);
+    bias — нули или заданный вектор логитов (как для linear/mlp t-расписания), если совпадает размерность.
+    """
+    lin = _final_linear_scheduler_transformer(module)
+    if lin is None:
+        return
+    nn.init.zeros_(lin.weight)
+    if lin.bias is None:
+        return
+    if logistic_bias_1d is not None and logistic_bias_1d.numel() == lin.bias.numel():
+        with torch.no_grad():
+            lin.bias.copy_(logistic_bias_1d.to(device=lin.bias.device, dtype=lin.bias.dtype))
+    else:
+        nn.init.zeros_(lin.bias)
+
+
 class PromptNoiseFiLMMlp(nn.Module):
     """
     Stable conditional MLP for coefficient tables that depends on both:
@@ -372,6 +405,9 @@ class GSWrapper(nn.Module):
         self.coeff_residual_scale = 0.01  # маленькая амплитуда
 
         def zero_last_layer(module):
+            if _final_linear_scheduler_transformer(module) is not None:
+                _init_scheduler_transformer_residual_head(module)
+                return
             if isinstance(module, nn.Sequential):
                 last = module[-1]
                 if isinstance(last, nn.Linear):
@@ -390,6 +426,12 @@ class GSWrapper(nn.Module):
         # C model
         if self.c_diff_model is not None:
             zero_last_layer(self.c_diff_model)
+
+        # Расписание t: те же начальные логиты, что у linear/mlp (inv stick-breaking для равномерной сетки)
+        if self.t_parametrization == "transformer":
+            t_unif = torch.linspace(1.0, self.t_eps, self.steps + 1).flip(0)
+            inv_logits = self.get_inv_t_steps(t_unif)
+            _init_scheduler_transformer_residual_head(self.mu_logit, logistic_bias_1d=inv_logits)
         
         # end init solver
         self.solver = solver
