@@ -412,6 +412,7 @@ class GeneralizedSolver:
         x: torch.Tensor, 
         steps: int, 
         order: int, 
+        before_step_fn: Optional[Any] = None,
         **kwargs
     ) -> torch.Tensor:
         """Sample from diffuision ODE.
@@ -444,6 +445,8 @@ class GeneralizedSolver:
         x_prev_list = [x]
 
         for step in range(1, steps + 1):
+            if before_step_fn is not None:
+                before_step_fn(step_idx=step - 1, x=x)
             t = timesteps[:, step] if timesteps.ndim == 2 else timesteps[step]
             cur_order = min(step, order)
             x = self.solver_update(x, model_prev_list, t_prev_list, t, order=cur_order, x_prev_list=x_prev_list)

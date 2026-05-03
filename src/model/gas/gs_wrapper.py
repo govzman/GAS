@@ -12,6 +12,7 @@ from src.model.gas.base_model import BaseModel
 from src.model.gas.generalized_solver import GeneralizedSolver
 from src.model.gas.adversarial_module.dist_adv_loss import DistAdversarialTraining
 from src.model.gas.synt_data import SyntDataType
+from src.model.gas.stepwise_predictors import create_stepwise_predictor
 
 
 def _final_linear_scheduler_transformer(module: nn.Module) -> Optional[nn.Linear]:
@@ -232,6 +233,23 @@ class GSWrapper(nn.Module):
             elif self.t_couple_parametrization in ("film_mlp", "prompt_noise_film_mlp"):
                 hidden_dim = int(getattr(self.solver_config, "t_couple_film_hidden_dim", 256))
                 self.t_couple_model = PromptNoiseFiLMMlp(out_dim=self.steps, hidden_dim=hidden_dim)
+            elif self.t_couple_parametrization == "stepwise":
+                self.t_couple_model = create_stepwise_predictor(
+                    out_dim=1,
+                    version=getattr(self.solver_config, "t_couple_stepwise_version", "lightweight"),
+                    latent_channels=self.latent_channels,
+                    text_embed_dim=self.text_embed_dim,
+                    encoder_width=int(getattr(self.solver_config, "t_couple_stepwise_encoder_width", 32)),
+                    num_conv_blocks=int(getattr(self.solver_config, "t_couple_stepwise_conv_blocks", 2)),
+                    attention_heads=int(getattr(self.solver_config, "t_couple_stepwise_attention_heads", 4)),
+                    num_mlp_layers=int(getattr(self.solver_config, "t_couple_stepwise_mlp_layers", 3)),
+                    hidden_dim=int(getattr(self.solver_config, "t_couple_stepwise_hidden_dim", 128)),
+                    image_encoder_depth=int(getattr(self.solver_config, "t_couple_stepwise_image_encoder_depth", 2)),
+                    image_encoder_width=int(getattr(self.solver_config, "t_couple_stepwise_image_encoder_width", 32)),
+                    cross_attention_heads=int(getattr(self.solver_config, "t_couple_stepwise_cross_attention_heads", 4)),
+                    attention_dim=int(getattr(self.solver_config, "t_couple_stepwise_attention_dim", 128)),
+                    number_of_transformer_blocks=int(getattr(self.solver_config, "t_couple_stepwise_transformer_blocks", 3)),
+                )
             else:
                 raise ValueError(f"Unsupported t_couple_parametrization={self.t_couple_parametrization}")
 
@@ -244,6 +262,24 @@ class GSWrapper(nn.Module):
         # init coef (a/c) parametrizations
         self.a_parametrization = getattr(self.solver_config, "a_parametrization", "diff")
         self.c_parametrization = getattr(self.solver_config, "c_parametrization", "diff")
+        self.coef_prediction_mode = getattr(self.solver_config, "coef_prediction_mode", "all_at_once")
+        if self.coef_prediction_mode not in ("all_at_once", "step_wise"):
+            raise ValueError(
+                f"Unsupported coef_prediction_mode={self.coef_prediction_mode}. "
+                "Expected one of: all_at_once, step_wise."
+            )
+        if (
+            "stepwise" in {self.a_parametrization, self.c_parametrization, self.t_couple_parametrization}
+            and self.coef_prediction_mode != "step_wise"
+        ):
+            raise ValueError(
+                "stepwise parametrizations require coef_prediction_mode=step_wise."
+            )
+        self.latent_channels = int(getattr(self.solver_config, "latent_channels", 4))
+        self.text_embed_dim = int(getattr(self.solver_config, "text_embed_dim", 768))
+        self._a_stepwise_table = None
+        self._c_stepwise_table = None
+        self._t_couple_stepwise_table = None
 
         self.a_diff_model = None
         self.c_diff_model = None
@@ -279,10 +315,30 @@ class GSWrapper(nn.Module):
                 if a_cfg is None:
                     a_cfg = config.scheduler_model
                 self.a_diff_model = instantiate(a_cfg, num_timesteps=out_dim)
+            elif self.a_parametrization == "stepwise":
+                self.a_diff_model = create_stepwise_predictor(
+                    out_dim=self.order,
+                    version=getattr(self.solver_config, "a_stepwise_version", "medium"),
+                    latent_channels=self.latent_channels,
+                    text_embed_dim=self.text_embed_dim,
+                    encoder_width=int(getattr(self.solver_config, "a_stepwise_encoder_width", 32)),
+                    num_conv_blocks=int(getattr(self.solver_config, "a_stepwise_conv_blocks", 2)),
+                    attention_heads=int(getattr(self.solver_config, "a_stepwise_attention_heads", 4)),
+                    num_mlp_layers=int(getattr(self.solver_config, "a_stepwise_mlp_layers", 3)),
+                    hidden_dim=int(getattr(self.solver_config, "a_stepwise_hidden_dim", 256)),
+                    image_encoder_depth=int(getattr(self.solver_config, "a_stepwise_image_encoder_depth", 2)),
+                    image_encoder_width=int(getattr(self.solver_config, "a_stepwise_image_encoder_width", 32)),
+                    cross_attention_heads=int(getattr(self.solver_config, "a_stepwise_cross_attention_heads", 4)),
+                    attention_dim=int(getattr(self.solver_config, "a_stepwise_attention_dim", 128)),
+                    number_of_transformer_blocks=int(getattr(self.solver_config, "a_stepwise_transformer_blocks", 3)),
+                )
             else:
                 raise ValueError(f"Unsupported a_parametrization={self.a_parametrization}")
             # used when cond_emb is None
-            self._a_bias = nn.Parameter(torch.zeros(self.order, self.steps), requires_grad=self.solver_config.a_requires_grad)
+            if self.a_parametrization == "stepwise":
+                self._a_bias = nn.Parameter(torch.zeros(self.order), requires_grad=self.solver_config.a_requires_grad)
+            else:
+                self._a_bias = nn.Parameter(torch.zeros(self.order, self.steps), requires_grad=self.solver_config.a_requires_grad)
 
         if self.c_parametrization != "diff":
             out_dim = self.order * self.steps
@@ -313,9 +369,29 @@ class GSWrapper(nn.Module):
                 if c_cfg is None:
                     c_cfg = config.scheduler_model
                 self.c_diff_model = instantiate(c_cfg, num_timesteps=out_dim)
+            elif self.c_parametrization == "stepwise":
+                self.c_diff_model = create_stepwise_predictor(
+                    out_dim=self.order,
+                    version=getattr(self.solver_config, "c_stepwise_version", "medium"),
+                    latent_channels=self.latent_channels,
+                    text_embed_dim=self.text_embed_dim,
+                    encoder_width=int(getattr(self.solver_config, "c_stepwise_encoder_width", 32)),
+                    num_conv_blocks=int(getattr(self.solver_config, "c_stepwise_conv_blocks", 2)),
+                    attention_heads=int(getattr(self.solver_config, "c_stepwise_attention_heads", 4)),
+                    num_mlp_layers=int(getattr(self.solver_config, "c_stepwise_mlp_layers", 3)),
+                    hidden_dim=int(getattr(self.solver_config, "c_stepwise_hidden_dim", 256)),
+                    image_encoder_depth=int(getattr(self.solver_config, "c_stepwise_image_encoder_depth", 2)),
+                    image_encoder_width=int(getattr(self.solver_config, "c_stepwise_image_encoder_width", 32)),
+                    cross_attention_heads=int(getattr(self.solver_config, "c_stepwise_cross_attention_heads", 4)),
+                    attention_dim=int(getattr(self.solver_config, "c_stepwise_attention_dim", 128)),
+                    number_of_transformer_blocks=int(getattr(self.solver_config, "c_stepwise_transformer_blocks", 3)),
+                )
             else:
                 raise ValueError(f"Unsupported c_parametrization={self.c_parametrization}")
-            self._c_bias = nn.Parameter(torch.zeros(self.order, self.steps), requires_grad=self.solver_config.c_requires_grad)
+            if self.c_parametrization == "stepwise":
+                self._c_bias = nn.Parameter(torch.zeros(self.order), requires_grad=self.solver_config.c_requires_grad)
+            else:
+                self._c_bias = nn.Parameter(torch.zeros(self.order, self.steps), requires_grad=self.solver_config.c_requires_grad)
 
         # baseline coefficients (current behavior)
         # ====== A coefficients ======
@@ -436,8 +512,37 @@ class GSWrapper(nn.Module):
         # end init solver
         self.solver = solver
 
-    def _update_dynamic_t_couple(self, noise: torch.Tensor, cond_emb: Optional[torch.Tensor]) -> None:
+    def _update_dynamic_t_couple(
+        self,
+        noise: torch.Tensor,
+        cond_emb: Optional[torch.Tensor],
+        step_idx: Optional[int] = None,
+    ) -> None:
         if self.t_couple_parametrization == "diff":
+            return
+
+        if self.t_couple_parametrization == "stepwise":
+            b = noise.shape[0]
+            if (
+                self._t_couple_stepwise_table is None
+                or self._t_couple_stepwise_table.shape != (b, self.steps)
+                or self._t_couple_stepwise_table.device != noise.device
+                or self._t_couple_stepwise_table.dtype != noise.dtype
+            ):
+                self._t_couple_stepwise_table = torch.zeros(
+                    b, self.steps, device=noise.device, dtype=noise.dtype
+                )
+            if cond_emb is not None:
+                t_couple_cur = self.t_couple_model(noise, cond_emb).reshape(b)
+            else:
+                t_couple_cur = self._t_couple_bias.reshape(1).expand(b).to(
+                    device=noise.device, dtype=noise.dtype
+                )
+            if step_idx is None:
+                self._t_couple_stepwise_table[:] = t_couple_cur.unsqueeze(1)
+            else:
+                self._t_couple_stepwise_table[:, step_idx] = t_couple_cur
+            self.solver.t_couple = self._t_couple_stepwise_table
             return
 
         if self.t_couple_parametrization in ("linear", "mlp"):
@@ -454,7 +559,12 @@ class GSWrapper(nn.Module):
 
         self.solver.t_couple = t_couple
 
-    def _update_dynamic_ac_coefs(self, noise: torch.Tensor, cond_emb: Optional[torch.Tensor]) -> None:
+    def _update_dynamic_ac_coefs(
+        self,
+        noise: torch.Tensor,
+        cond_emb: Optional[torch.Tensor],
+        step_idx: Optional[int] = None,
+    ) -> None:
         """
         If enabled by config, compute batch-dependent a/c coefficient tables and
         attach them to the solver as tensors of shape (B, steps).
@@ -472,6 +582,8 @@ class GSWrapper(nn.Module):
                     a_flat = self.a_diff_model(noise, cond_emb)  # (B, out_dim)
                 else:
                     a_flat = self._a_bias.reshape(1, out_dim)
+            elif self.a_parametrization == "stepwise":
+                a_flat = None
             else:  # transformer
                 if cond_emb is not None:
                     a_flat = self.a_diff_model(noise, cond_emb)  # (B, out_dim)
@@ -479,7 +591,30 @@ class GSWrapper(nn.Module):
                     dev = noise.device
                     dummy_cond = torch.zeros(1, 77, 768, device=dev)
                     a_flat = self.a_diff_model(noise, dummy_cond)  # (1, out_dim)
-            a_all = a_flat.reshape(a_flat.shape[0], self.order, self.steps)
+            if self.a_parametrization == "stepwise":
+                b = noise.shape[0]
+                if (
+                    self._a_stepwise_table is None
+                    or self._a_stepwise_table.shape != (b, self.order, self.steps)
+                    or self._a_stepwise_table.device != noise.device
+                    or self._a_stepwise_table.dtype != noise.dtype
+                ):
+                    self._a_stepwise_table = torch.zeros(
+                        b, self.order, self.steps, device=noise.device, dtype=noise.dtype
+                    )
+                if cond_emb is not None:
+                    a_cur = self.a_diff_model(noise, cond_emb)  # (B, order)
+                else:
+                    a_cur = self._a_bias.reshape(1, self.order).expand(b, self.order).to(
+                        device=noise.device, dtype=noise.dtype
+                    )
+                if step_idx is None:
+                    self._a_stepwise_table[:] = a_cur.unsqueeze(-1)
+                else:
+                    self._a_stepwise_table[:, :, step_idx] = a_cur
+                a_all = self._a_stepwise_table
+            else:
+                a_all = a_flat.reshape(a_flat.shape[0], self.order, self.steps)
             
             for i in range(1, self.order + 1):
                 self.solver.__setattr__(f"a{i}_diff", a_all[:, i - 1, :])
@@ -497,6 +632,8 @@ class GSWrapper(nn.Module):
                     c_flat = self.c_diff_model(noise, cond_emb)  # (B, out_dim)
                 else:
                     c_flat = self._c_bias.reshape(1, out_dim)
+            elif self.c_parametrization == "stepwise":
+                c_flat = None
             else:  # transformer
                 if cond_emb is not None:
                     c_flat = self.c_diff_model(noise, cond_emb)  # (B, out_dim)
@@ -504,7 +641,30 @@ class GSWrapper(nn.Module):
                     dev = noise.device
                     dummy_cond = torch.zeros(1, 77, 768, device=dev)
                     c_flat = self.c_diff_model(noise, dummy_cond)  # (1, out_dim)
-            c_all = c_flat.reshape(c_flat.shape[0], self.order, self.steps)
+            if self.c_parametrization == "stepwise":
+                b = noise.shape[0]
+                if (
+                    self._c_stepwise_table is None
+                    or self._c_stepwise_table.shape != (b, self.order, self.steps)
+                    or self._c_stepwise_table.device != noise.device
+                    or self._c_stepwise_table.dtype != noise.dtype
+                ):
+                    self._c_stepwise_table = torch.zeros(
+                        b, self.order, self.steps, device=noise.device, dtype=noise.dtype
+                    )
+                if cond_emb is not None:
+                    c_cur = self.c_diff_model(noise, cond_emb)  # (B, order)
+                else:
+                    c_cur = self._c_bias.reshape(1, self.order).expand(b, self.order).to(
+                        device=noise.device, dtype=noise.dtype
+                    )
+                if step_idx is None:
+                    self._c_stepwise_table[:] = c_cur.unsqueeze(-1)
+                else:
+                    self._c_stepwise_table[:, :, step_idx] = c_cur
+                c_all = self._c_stepwise_table
+            else:
+                c_all = c_flat.reshape(c_flat.shape[0], self.order, self.steps)
             
             for i in range(1, self.order + 1):
                 self.solver.__setattr__(f"c{i}_diff", c_all[:, i - 1, :])
@@ -631,12 +791,21 @@ class GSWrapper(nn.Module):
             torch.tensor: Sampled images
         """
         cond_emb = getattr(self.model.model_fn, "condition", None)
-        self._update_dynamic_t_couple(noise=noise, cond_emb=cond_emb)
-        self._update_dynamic_ac_coefs(noise=noise, cond_emb=cond_emb)
+        if self.coef_prediction_mode == "all_at_once":
+            self._update_dynamic_t_couple(noise=noise, cond_emb=cond_emb)
+            self._update_dynamic_ac_coefs(noise=noise, cond_emb=cond_emb)
+
+        before_step_fn = None
+        if self.coef_prediction_mode == "step_wise":
+            def before_step_fn(step_idx: int, x: torch.Tensor) -> None:
+                self._update_dynamic_t_couple(noise=x, cond_emb=cond_emb, step_idx=step_idx)
+                self._update_dynamic_ac_coefs(noise=x, cond_emb=cond_emb, step_idx=step_idx)
+
         images = self.solver.sample(
             x=noise,
             steps=self.steps,
             order=self.order,
+            before_step_fn=before_step_fn,
         )
         return None, images
     
@@ -737,12 +906,21 @@ class GSWrapperLatent(GSWrapper):
         if condition is not None:
             self.model.set_condition(condition)
         cond_emb = getattr(self.model.model_fn, "condition", None)
-        self._update_dynamic_t_couple(noise=noise, cond_emb=cond_emb)
-        self._update_dynamic_ac_coefs(noise=noise, cond_emb=cond_emb)
+        if self.coef_prediction_mode == "all_at_once":
+            self._update_dynamic_t_couple(noise=noise, cond_emb=cond_emb)
+            self._update_dynamic_ac_coefs(noise=noise, cond_emb=cond_emb)
+
+        before_step_fn = None
+        if self.coef_prediction_mode == "step_wise":
+            def before_step_fn(step_idx: int, x: torch.Tensor) -> None:
+                self._update_dynamic_t_couple(noise=x, cond_emb=cond_emb, step_idx=step_idx)
+                self._update_dynamic_ac_coefs(noise=x, cond_emb=cond_emb, step_idx=step_idx)
+
         latents = self.solver.sample(
             x=noise,
             steps=self.steps,
             order=self.order,
+            before_step_fn=before_step_fn,
         )
 
         if decode:

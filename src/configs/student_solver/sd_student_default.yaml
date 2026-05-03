@@ -1,8 +1,13 @@
 steps: 4
 order: 3
 t_eps: 0.001
-t_couple_parametrization: film_mlp   # diff | linear | mlp | film_mlp | prompt_noise_film_mlp
+latent_channels: 4
+text_embed_dim: 768
+t_couple_parametrization: film_mlp   # diff | linear | mlp | film_mlp | prompt_noise_film_mlp | stepwise
 t_couple_film_hidden_dim: 256
+t_couple_stepwise_version: lightweight
+t_couple_stepwise_hidden_dim: 128
+t_couple_stepwise_mlp_layers: 2
 
 # Backward/forward compatible with code:
 # - legacy key: t_schedule_parametrization
@@ -10,8 +15,24 @@ t_couple_film_hidden_dim: 256
 t_parametrization: film_mlp          # diff | linear | mlp | transformer | film_mlp | prompt_noise_film_mlp
 t_schedule_parametrization: film_mlp # kept for older configs
 t_film_hidden_dim: 256
-a_parametrization: film_mlp # diff | linear | mlp | transformer
-c_parametrization: film_mlp # diff | linear | mlp | transformer
+a_parametrization: film_mlp # diff | linear | mlp | transformer | stepwise
+c_parametrization: film_mlp # diff | linear | mlp | transformer | stepwise
+# How to predict dynamic a/c coefficients:
+# - all_at_once: predict full coefficient tables once before sampling (current behavior)
+# - step_wise:   recompute coefficients before each GAS solver step
+coef_prediction_mode: all_at_once
+a_stepwise_version: medium
+a_stepwise_encoder_width: 32
+a_stepwise_conv_blocks: 2
+a_stepwise_attention_heads: 4
+a_stepwise_hidden_dim: 256
+a_stepwise_mlp_layers: 3
+c_stepwise_version: medium
+c_stepwise_encoder_width: 32
+c_stepwise_conv_blocks: 2
+c_stepwise_attention_heads: 4
+c_stepwise_hidden_dim: 256
+c_stepwise_mlp_layers: 3
 use_theory_coef: true
 guidance_scale: 7.5
 t_requires_grad: true
