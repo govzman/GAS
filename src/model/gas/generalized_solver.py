@@ -440,7 +440,11 @@ class GeneralizedSolver:
             t = timesteps[0]
         t_prev_list = [t]
 
-        
+        # Ensure dynamic step-wise parameters are synced with current batch
+        # before the very first model evaluation (step index 0).
+        if before_step_fn is not None:
+            before_step_fn(step_idx=0, x=x)
+
         model_prev_list = [self.model_fn(x, t)]
         x_prev_list = [x]
 

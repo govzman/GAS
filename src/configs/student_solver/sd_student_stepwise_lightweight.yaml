@@ -1,4 +1,4 @@
-# sd_student_stepwise_medium.yaml
+# sd_student_stepwise_lightweight.yaml
 steps: 4
 order: 3
 t_eps: 0.001
@@ -16,19 +16,13 @@ t_couple_stepwise_mlp_layers: 2
 t_couple_requires_grad: true
 
 a_parametrization: stepwise
-a_stepwise_version: medium
-a_stepwise_encoder_width: 32
-a_stepwise_conv_blocks: 2
-a_stepwise_attention_heads: 4
+a_stepwise_version: lightweight  # ← ключевой параметр!
 a_stepwise_hidden_dim: 256
 a_stepwise_mlp_layers: 3
 a_requires_grad: true
 
 c_parametrization: stepwise
-c_stepwise_version: medium
-c_stepwise_encoder_width: 32
-c_stepwise_conv_blocks: 2
-c_stepwise_attention_heads: 4
+c_stepwise_version: lightweight
 c_stepwise_hidden_dim: 256
 c_stepwise_mlp_layers: 3
 c_requires_grad: true
