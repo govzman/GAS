@@ -92,7 +92,7 @@ def main(config: DictConfig) -> None:
     a_params, other_params = split_parameters(gs_wrapper)
     optim = instantiate(config.optimizer, params=other_params) if other_params else None
     optim_a_params = instantiate(config.optimizer_a_params, params=a_params) if a_params else None
-    
+
     ema = ExponentialMovingAverage(gs_wrapper.parameters(), decay=config.trainer.ema_decay)
     n_iters = config.trainer.n_iters
     config.trainer.epoch_num = n_iters // len(data.train_loader) + int(

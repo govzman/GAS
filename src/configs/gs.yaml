@@ -11,9 +11,19 @@ optimizer:
   _target_: torch.optim.AdamW
   lr: 1e-3
 
+lr_scheduler:
+  _target_: torch.optim.lr_scheduler.CosineAnnealingLR
+  T_max: ${trainer.n_iters}
+  eta_min: 0.0
+
 optimizer_a_params:
   _target_: torch.optim.AdamW
   lr: 1e-3
+
+lr_scheduler_a_params:
+  _target_: torch.optim.lr_scheduler.CosineAnnealingLR
+  T_max: ${trainer.n_iters}
+  eta_min: 0.0
 
 loss_config:
   loss_type: "GS"
@@ -21,6 +31,14 @@ loss_config:
   disc_weight: 1
   disc_type: latent_4
   disc_lr: 0.00001
+  # REPA (DINOv2 alignment); enable with loss_config.use_repa=true
+  use_repa: false
+  repa_weight: 0.5
+  repa_model: dinov2_vitb14
+  repa_loss_type: cosine
+  repa_grad_through_decoder: true
+  repa_log_per_layer: false
+  repa_pretrained: true
   
 trainer:
   n_iters: 5000

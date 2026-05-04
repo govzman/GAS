@@ -165,6 +165,25 @@ class GSWrapper(nn.Module):
 
         # construct loss
         self.loss_config = config.loss_config
+
+        # REPA (Representation Alignment, frozen DINOv2)
+        self.use_repa = getattr(self.loss_config, "use_repa", False)
+        self.repa_loss = None
+        if self.use_repa:
+            from src.model.gas.repa_loss import FinalREPALoss
+
+            self.repa_loss = FinalREPALoss(
+                model_name=getattr(self.loss_config, "repa_model", "dinov2_vitb14"),
+                layer_indices=getattr(self.loss_config, "repa_layer_indices", None),
+                loss_type=getattr(self.loss_config, "repa_loss_type", "cosine"),
+                layer_weights=getattr(self.loss_config, "repa_layer_weights", None),
+                use_cls_token=getattr(self.loss_config, "repa_use_cls_token", True),
+                use_patch_tokens=getattr(self.loss_config, "repa_use_patch_tokens", True),
+                normalize_features=getattr(self.loss_config, "repa_normalize_features", True),
+                pretrained=getattr(self.loss_config, "repa_pretrained", True),
+            )
+            self.repa_loss.eval()
+
         assert self.loss_config.loss_type in ["GS", "GAS"]
         if self.loss_config.loss_type == "GAS":
             self.adv_loss = DistAdversarialTraining(self.loss_config)
@@ -951,11 +970,7 @@ class GSWrapperLatent(GSWrapper):
             if condition is not None:
                 self.model.set_condition(condition)
             cond_emb = self.model.model_fn.condition
-            print('??', cond_emb.shape if cond_emb is not None else None)
             d['timesteps'] = self.solver.get_time_steps(noise, cond_emb)
-            print(d['timesteps'])
-            print(condition)
-            # print(cond_emb)
         student_latents, _ = self.student_sampler_fn(
             noise,
             condition=condition
@@ -965,6 +980,23 @@ class GSWrapperLatent(GSWrapper):
         d['loss_l2_latents'] = torch.square(latents - student_latents).mean((1, 2, 3))
         d['x0_t'] = self.interpolate_lpips(images)
         d['latents_s'] = student_latents
+
+        if self.use_repa and self.repa_loss is not None:
+            dec_grad = getattr(self.loss_config, "repa_grad_through_decoder", True)
+            dec_ctx = torch.enable_grad() if dec_grad else torch.no_grad()
+            with dec_ctx:
+                student_images = self.model.decode(student_latents)
+            d["x0_s"] = self.interpolate_lpips(student_images)
+            log_repa_layers = getattr(self.loss_config, "repa_log_per_layer", False)
+            loss_repa, repa_info = self.repa_loss(
+                student_images=student_images,
+                teacher_images=images,
+                return_detailed=log_repa_layers,
+            )
+            d["loss_repa"] = loss_repa
+            if repa_info is not None:
+                for rk, rv in repa_info.items():
+                    d[rk] = rv
 
         if self.loss_config.loss_type == "GAS":
             with torch.no_grad():
@@ -994,6 +1026,14 @@ class GSWrapperLatent(GSWrapper):
 
             assert d['gen_loss_adv'].shape == d[self.loss_config.loss_key].shape, f"SHAPE = {d['gen_loss_adv'].shape}, {d[self.loss_config.loss_key].shape}"
 
-        d['loss_total'] = self.loss_config.disc_weight * d.get('gen_loss_adv', 0.) + d[self.loss_config.loss_key]
+        base_loss = d[self.loss_config.loss_key]
+        adv_part = self.loss_config.disc_weight * d.get("gen_loss_adv", 0.0)
+        repa_part = torch.tensor(
+            0.0, device=base_loss.device, dtype=base_loss.dtype
+        )
+        if self.use_repa and self.repa_loss is not None and "loss_repa" in d:
+            rw = float(getattr(self.loss_config, "repa_weight", 0.5))
+            repa_part = rw * d["loss_repa"].to(device=base_loss.device, dtype=base_loss.dtype)
+        d["loss_total"] = adv_part + base_loss + repa_part
 
         return d

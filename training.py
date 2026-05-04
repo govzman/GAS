@@ -7,6 +7,7 @@ from torch_ema import ExponentialMovingAverage
 from tqdm import tqdm
 
 import comet_ml
+from hydra.utils import instantiate
 from omegaconf import OmegaConf
 from evaluate import NOT_LOG_KEYS, evaluate_wrapper
 from src.model.gas.gs_wrapper import GSWrapper
@@ -41,6 +42,13 @@ def train(
         gs_wrapper, data.train_loader, data.test_loader = accelerator.prepare(
             gs_wrapper, data.train_loader, data.test_loader
         )
+
+    lr_scheduler = None
+    lr_scheduler_a_params = None
+    if optim and hasattr(config, "lr_scheduler") and config.lr_scheduler is not None:
+        lr_scheduler = instantiate(config.lr_scheduler, optimizer=optim)
+    if optim_a_params and hasattr(config, "lr_scheduler_a_params") and config.lr_scheduler_a_params is not None:
+        lr_scheduler_a_params = instantiate(config.lr_scheduler_a_params, optimizer=optim_a_params)
 
     if is_main:
         dir = os.path.join("./checkpoints", date_str)
@@ -97,9 +105,13 @@ def train(
                     
                     if optim:
                         optim.step()
+                        if lr_scheduler is not None:
+                            lr_scheduler.step()
                         optim.zero_grad()
                     if optim_a_params:
                         optim_a_params.step()
+                        if lr_scheduler_a_params is not None:
+                            lr_scheduler_a_params.step()
                         optim_a_params.zero_grad()
                     ema.update(gs_wrapper.parameters())
 
@@ -129,9 +141,13 @@ def train(
 
                         if optim:
                             optim.step()
+                            if lr_scheduler is not None:
+                                lr_scheduler.step()
                             optim.zero_grad()
                         if optim_a_params:
                             optim_a_params.step()
+                            if lr_scheduler_a_params is not None:
+                                lr_scheduler_a_params.step()
                             optim_a_params.zero_grad()
                         ema.update(gs_wrapper.parameters())
 
@@ -196,8 +212,12 @@ def train(
                 }
                 if optim:
                     ckpt["optim"] = optim.state_dict()
+                if lr_scheduler is not None:
+                    ckpt["lr_scheduler"] = lr_scheduler.state_dict()
                 if optim_a_params:
                     ckpt["optim_a_params"] = optim_a_params.state_dict()
+                if lr_scheduler_a_params is not None:
+                    ckpt["lr_scheduler_a_params"] = lr_scheduler_a_params.state_dict()
                 ckpt_path = os.path.join(dir, f"{global_step}.pt")
                 if accelerator is not None:
                     accelerator.save(ckpt, ckpt_path)
