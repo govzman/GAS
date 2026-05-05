@@ -37,6 +37,7 @@ loss_config:
   repa_model: dinov2_vitb14
   repa_loss_type: cosine
   repa_grad_through_decoder: true
+  use_repa_in_eval: false
   repa_log_per_layer: false
   repa_pretrained: true
   

@@ -168,6 +168,7 @@ class GSWrapper(nn.Module):
 
         # REPA (Representation Alignment, frozen DINOv2)
         self.use_repa = getattr(self.loss_config, "use_repa", False)
+        self.use_repa_in_eval = getattr(self.loss_config, "use_repa_in_eval", False)
         self.repa_loss = None
         if self.use_repa:
             from src.model.gas.repa_loss import FinalREPALoss
@@ -981,8 +982,11 @@ class GSWrapperLatent(GSWrapper):
         d['x0_t'] = self.interpolate_lpips(images)
         d['latents_s'] = student_latents
 
-        if self.use_repa and self.repa_loss is not None:
-            dec_grad = getattr(self.loss_config, "repa_grad_through_decoder", True)
+        apply_repa = self.use_repa and self.repa_loss is not None and (
+            is_train or self.use_repa_in_eval
+        )
+        if apply_repa:
+            dec_grad = getattr(self.loss_config, "repa_grad_through_decoder", True) if is_train else False
             dec_ctx = torch.enable_grad() if dec_grad else torch.no_grad()
             with dec_ctx:
                 student_images = self.model.decode(student_latents)
