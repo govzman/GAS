@@ -141,17 +141,13 @@ def main(config: DictConfig):
     os.makedirs(outdir, exist_ok=True)
 
     # Prepare configs and generation settings.
-    gs_solver = checkpoint_path is not None
     model_config = config.model
+    synthetic_cfg = config.get("synthetic_gs_dataset", None)
+    use_synthetic_gs = bool(getattr(synthetic_cfg, "enabled", False))
+    gs_solver = checkpoint_path is not None or use_synthetic_gs
     solver_config = (
         config.student_solver if gs_solver else config.teacher_solver
     )
-    
-    synthetic_cfg = config.get("synthetic_gs_dataset", None)
-    use_synthetic_gs = bool(getattr(synthetic_cfg, "enabled", False))
-
-    if use_synthetic_gs and not gs_solver:
-        raise ValueError("synthetic_gs_dataset mode requires checkpoint_path (GS solver).")
 
     if use_synthetic_gs:
         synthetic_count = int(getattr(synthetic_cfg, "count", 100))
@@ -186,7 +182,13 @@ def main(config: DictConfig):
             solver_config.order = num_steps
 
         gs_wrapper = get_gs_wrapper(model, config)
-        gs_wrapper.load_checkpoint(checkpoint_path=checkpoint_path)
+        if checkpoint_path is not None:
+            gs_wrapper.load_checkpoint(checkpoint_path=checkpoint_path)
+        else:
+            dist.print0(
+                "Running GS generation without checkpoint: using wrapper initialization "
+                "and manual synthetic coefficients."
+            )
         sampler_fn = partial(gs_wrapper.student_sampler_fn, decode=True)
 
     # Generating images with UniPC/iPNDM solvers.
