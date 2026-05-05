@@ -1,36 +1,79 @@
 import torch
 import pickle
 from torch.utils.data import DataLoader, Dataset
-from typing import Optional, Union, List, Tuple
+from typing import Any, Dict, Optional, Union, List, Tuple, Sequence
+
 from omegaconf import DictConfig
 
 SyntDataType = Tuple[
-    torch.Tensor, torch.Tensor, 
+    torch.Tensor,
+    torch.Tensor,
     Optional[torch.Tensor],
-    Optional[Union[torch.Tensor, List[str]]]
+    Optional[Union[torch.Tensor, List[str]]],
+    Optional[Dict[str, torch.Tensor]],
 ]
 
+GT_SOLVER_PREFIX = "manual_solver_params."
+
+
+def move_batch_to_device(batch: Tuple[Any, ...], device: torch.device) -> Tuple[Any, ...]:
+    """Move tensors in batch to device; supports optional dict of GT solver tensors."""
+    out: List[Any] = []
+    for v in batch:
+        if isinstance(v, torch.Tensor):
+            out.append(v.to(device))
+        elif isinstance(v, dict):
+            out.append(
+                {
+                    k: t.to(device) if isinstance(t, torch.Tensor) else t
+                    for k, t in v.items()
+                }
+            )
+        else:
+            out.append(v)
+    return tuple(out)
+
+
 class SyntDataset(Dataset):
-    """Dataset class. 
-    Expects dataset in format as done in generate.py file.
+    """Dataset class.
+    Expects dataset in format as done in generate.py / collate.py (teacher pickle).
+
+    If the pickle contains flattened keys ``manual_solver_params.<name>``, each sample
+    returns a dict of those tensors as the 5th tuple element for training-time GT comparison.
     """
-    
+
     def __init__(self, dataset_path: str):
         with open(dataset_path, "rb") as fp:
             self.data = pickle.load(fp)
 
-        self.noise_key = 'noise'
-        self.images_key = 'images'
-        self.latent_key = 'latents'
-        self.condition_key = 'condition'
+        self.noise_key = "noise"
+        self.images_key = "images"
+        self.latent_key = "latents"
+        self.condition_key = "condition"
+
+        self.gt_solver_param_names: List[str] = sorted(
+            k[len(GT_SOLVER_PREFIX) :]
+            for k in self.data.keys()
+            if k.startswith(GT_SOLVER_PREFIX)
+        )
 
     def __len__(self):
         return len(self.data[self.images_key])
 
     def __getitem__(self, idx):
-        return (
-            self.data[self.noise_key][idx], self.data[self.images_key][idx],
-            self.data[self.latent_key][idx], self.data[self.condition_key][idx])
+        noise = self.data[self.noise_key][idx]
+        images = self.data[self.images_key][idx]
+        latents = self.data[self.latent_key][idx]
+        condition = self.data[self.condition_key][idx]
+
+        gt_solver_params = None
+        if self.gt_solver_param_names:
+            gt_solver_params = {
+                name: self.data[f"{GT_SOLVER_PREFIX}{name}"][idx]
+                for name in self.gt_solver_param_names
+            }
+
+        return noise, images, latents, condition, gt_solver_params
 
 
 class SyntDataLoaders:
@@ -93,36 +136,58 @@ class SyntDataLoaders:
             )
         )
 
+        n_gt = len(dataset.gt_solver_param_names)
         print(f"""
             -------------- Dataloader info --------------
             \tUse latents = {self.config.use_latents}
             \tUse condition = {self.config.use_condition}
+            \tGT solver params in teacher pickle = {n_gt} tensors
             \tlen(train_loader) = {len(self.train_loader)}
             \tlen(test_loader) = {len(self.test_loader)}
         """)
 
-    def collate_fn(self, batch: Tuple[SyntDataType]) -> SyntDataType:
+    def collate_fn(self, batch: Sequence[SyntDataType]) -> SyntDataType:
         """Collates synthetic dataset from teacher pickle into batch.
-        
+
         First two arguments are treated like torch.Tensor noise and images samples.
         Second two arguments are optional and can be used for latent diffusion models.
         They are treated as latents tensors and conditions.
+        Optional 5th element: dict of per-sample GT GS tensors (batch-stacked).
 
         Args:
-            batch (tuple[SyntDataType]): Sequense of tuples is SyntDataType format.
+            batch: Sequence of tuples ``(noise, images, latents, condition, gt_solver_params?)``.
+                Older caches may omit the 5th element.
 
         Returns:
-            SyntDataType: Collated batch.
+            Tuple of batched tensors / condition / optional GT dict.
         """
-        noise, images, latents, condition = zip(*batch)
+        rows = list(zip(*batch))
+        if len(rows) == 5:
+            noise, images, latents, condition, gt_list = rows
+        elif len(rows) == 4:
+            noise, images, latents, condition = rows
+            gt_list = None
+        else:
+            raise ValueError(f"Unexpected batch tuple length {len(rows)}")
 
         noise = torch.stack(noise)
         images = torch.stack(images)
         latents = torch.stack(latents) if self.config.use_latents else None
 
         if self.config.use_condition:
-            condition = torch.stack(condition) if isinstance(condition[0], torch.Tensor) else list(condition)
+            condition = (
+                torch.stack(condition)
+                if isinstance(condition[0], torch.Tensor)
+                else list(condition)
+            )
         else:
             condition = None
 
-        return noise, images, latents, condition
+        gt_batched = None
+        if gt_list is not None and gt_list[0] is not None:
+            keys = gt_list[0].keys()
+            gt_batched = {
+                k: torch.stack([sample_gt[k] for sample_gt in gt_list]) for k in keys
+            }
+
+        return noise, images, latents, condition, gt_batched

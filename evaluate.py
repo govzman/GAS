@@ -4,7 +4,7 @@ import torch
 
 import comet_ml
 from src.model.gas.gs_wrapper import GSWrapper
-from src.model.gas.synt_data import SyntDataLoaders
+from src.model.gas.synt_data import SyntDataLoaders, move_batch_to_device
 from src.model.gas.utils.loggers import log_end_img, log_t_steps_plot
 
 NOT_LOG_KEYS = ["timesteps", "x0_s", "x0_t", "latents_s"]
@@ -20,7 +20,7 @@ def evaluate_wrapper(
     global_step: int
 ) -> None:
     """Evaluating GS on test dataset and visualization batch for logging."""
-    batch = [v.to(device) if isinstance(v, torch.Tensor) else v for v in data.vis_batch]
+    batch = move_batch_to_device(data.vis_batch, device)
 
     d_res = {}
 
@@ -48,7 +48,7 @@ def evaluate_wrapper(
     log_d = defaultdict(float)
     num_elements = 0
     for batch in data.test_loader:
-        batch = [v.to(device) if isinstance(v, torch.Tensor) else v for v in batch]
+        batch = move_batch_to_device(batch, device)
         out_d = gs_wrapper.forward(batch=batch, return_timesteps=False, is_train=False)
         bs = batch[0].shape[0]
         num_elements += bs

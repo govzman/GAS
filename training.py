@@ -11,7 +11,7 @@ from hydra.utils import instantiate
 from omegaconf import OmegaConf
 from evaluate import NOT_LOG_KEYS, evaluate_wrapper
 from src.model.gas.gs_wrapper import GSWrapper
-from src.model.gas.synt_data import SyntDataset
+from src.model.gas.synt_data import SyntDataset, move_batch_to_device
 from src.model.gas.utils.loggers import log_end_img, log_grads, log_t_steps, log_weights
 from typing import Optional
 
@@ -89,7 +89,7 @@ def train(
 
             t_start = time.time()
 
-            batch = [v.to(device) if isinstance(v, torch.Tensor) else v for v in batch]
+            batch = move_batch_to_device(batch, device)
 
             if accelerator is None:
                 res_d = gs_wrapper.forward(batch=batch, return_timesteps=True)
@@ -164,6 +164,21 @@ def train(
             for k, v in res_d.items():
                 if k not in NOT_LOG_KEYS:
                     log_d[f"train/{k}"] = v.mean().item()
+
+            print_every = int(getattr(config.trainer, "print_gt_solver_every", 0))
+            if is_main and print_every > 0 and global_step % print_every == 0:
+                gt_mse_keys = sorted(
+                    k for k in res_d.keys() if k.startswith("gt_mse_") and k != "gt_mse_mean"
+                )
+                if gt_mse_keys:
+                    mean_line = ""
+                    if "gt_mse_mean" in res_d:
+                        mean_line = f"gt_mse_mean(batch avg)={res_d['gt_mse_mean'].mean().item():.6g} | "
+                    detail = " | ".join(
+                        f"{k[len('gt_mse_'):]}={res_d[k].mean().item():.6g}"
+                        for k in gt_mse_keys
+                    )
+                    print(f"[train step {global_step}] GT coeff MSE vs predicted — {mean_line}{detail}")
 
             if exp is not None:
                 exp.log_metrics(log_d, step=global_step)

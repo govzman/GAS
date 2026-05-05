@@ -44,6 +44,8 @@ loss_config:
 trainer:
   n_iters: 5000
   epoch_num: 2500
+  # Print GT vs predicted GS coefficient MSE (when teacher pickle has manual_solver_params.*); 0 = off.
+  print_gt_solver_every: 100
   # Backward compatible: training.py used to read iters_to_accumulate directly.
   # With Accelerate we primarily use accumulation_steps.
   iters_to_accumulate: 2

@@ -3,7 +3,7 @@ import lpips
 
 import torch
 from torch import nn
-from typing import Tuple, Optional, Any, List
+from typing import Tuple, Optional, Any, List, Dict
 from torch.nn.functional import interpolate
 from torch_ema import ExponentialMovingAverage
 from ml_collections import ConfigDict
@@ -812,6 +812,67 @@ class GSWrapper(nn.Module):
             noise_schedule=self.model.ns,
         )
         return solver
+
+    @staticmethod
+    def _align_pred_to_gt(pred: torch.Tensor, gt: torch.Tensor) -> Optional[torch.Tensor]:
+        """Broadcast predicted solver tensor to ground-truth shape when possible."""
+        pred = pred.to(device=gt.device, dtype=gt.dtype)
+        if pred.shape == gt.shape:
+            return pred
+        try:
+            return torch.broadcast_to(pred, gt.shape)
+        except RuntimeError:
+            return None
+
+    def _predicted_gs_solver_tensors(
+        self,
+        noise: torch.Tensor,
+        cond_emb: Optional[torch.Tensor],
+    ) -> Dict[str, torch.Tensor]:
+        """Snapshot coefficient tensors currently attached to the solver (same storage as teacher pickle)."""
+        out: Dict[str, torch.Tensor] = {}
+        for i in range(1, self.order + 1):
+            for prefix in ("a", "c"):
+                name = f"{prefix}{i}_diff"
+                t = getattr(self.solver, name, None)
+                if isinstance(t, torch.Tensor):
+                    out[name] = t
+        tc = getattr(self.solver, "t_couple", None)
+        if isinstance(tc, torch.Tensor):
+            out["t_couple"] = tc
+        ts = self.solver.get_time_steps(noise, cond_emb)
+        out["timesteps"] = ts
+        return out
+
+    def _add_gt_solver_metrics(
+        self,
+        d: dict,
+        gt_solver_params: Optional[Dict[str, torch.Tensor]],
+        noise: torch.Tensor,
+        cond_emb: Optional[torch.Tensor],
+    ) -> None:
+        """Per-batch-element MSE/MAE vs teacher ``manual_solver_params`` when present."""
+        if not gt_solver_params:
+            return
+        pred_all = self._predicted_gs_solver_tensors(noise, cond_emb)
+        mse_list: List[torch.Tensor] = []
+        mae_list: List[torch.Tensor] = []
+        for name, gt in gt_solver_params.items():
+            if name not in pred_all:
+                continue
+            aligned = self._align_pred_to_gt(pred_all[name], gt)
+            if aligned is None:
+                continue
+            diff = aligned - gt
+            mse = diff.flatten(start_dim=1).pow(2).mean(dim=1)
+            mae = diff.flatten(start_dim=1).abs().mean(dim=1)
+            d[f"gt_mse_{name}"] = mse
+            d[f"gt_mae_{name}"] = mae
+            mse_list.append(mse)
+            mae_list.append(mae)
+        if mse_list:
+            d["gt_mse_mean"] = torch.stack(mse_list, dim=0).mean(dim=0)
+            d["gt_mae_mean"] = torch.stack(mae_list, dim=0).mean(dim=0)
     
     @contextlib.contextmanager
     def _manual_solver_params_context(self, manual_solver_params: Optional[dict]):
@@ -888,8 +949,9 @@ class GSWrapper(nn.Module):
             dict: Dictionary of all losses and model outputs. 
                 Has `loss_total` key as a weighted sum of adversarial and distillation losses.
         """
-        assert len(batch) == 4, f"len(batch) is expected to be 4, yours is {len(batch)}"
-        noise, images, _, _ = batch
+        assert len(batch) in (4, 5), f"len(batch) expected 4 or 5, got {len(batch)}"
+        gt_solver_params = batch[4] if len(batch) == 5 else None
+        noise, images, _, _ = batch[:4]
 
         d = {}
         if return_timesteps:
@@ -898,6 +960,8 @@ class GSWrapper(nn.Module):
             cond_emb = getattr(self.model.model_fn, "condition", None)
             d['timesteps'] = self.solver.get_time_steps(noise, cond_emb)
         _, student_images = self.student_sampler_fn(noise)
+        cond_emb = getattr(self.model.model_fn, "condition", None)
+        self._add_gt_solver_metrics(d, gt_solver_params, noise, cond_emb)
 
         d['loss_l1'] = torch.abs(student_images - images).mean((1, 2, 3))
         d['loss_l2'] = torch.square(student_images - images).mean((1, 2, 3))
@@ -994,8 +1058,9 @@ class GSWrapperLatent(GSWrapper):
         return latents, images
     
     def forward(self, batch: SyntDataType, return_timesteps: bool = False, is_train: bool = True) -> dict:
-        assert len(batch) == 4, f"len(batch) is expected to be 4, yours is {len(batch)}"
-        noise, images, latents, condition = batch
+        assert len(batch) in (4, 5), f"len(batch) expected 4 or 5, got {len(batch)}"
+        gt_solver_params = batch[4] if len(batch) == 5 else None
+        noise, images, latents, condition = batch[:4]
 
         d = {}
         if return_timesteps:
@@ -1007,6 +1072,8 @@ class GSWrapperLatent(GSWrapper):
             noise,
             condition=condition
         )
+        cond_emb = getattr(self.model.model_fn, "condition", None)
+        self._add_gt_solver_metrics(d, gt_solver_params, noise, cond_emb)
 
         d['loss_l1_latents'] = torch.abs(latents - student_latents).mean((1, 2, 3))
         d['loss_l2_latents'] = torch.square(latents - student_latents).mean((1, 2, 3))
