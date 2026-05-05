@@ -20,3 +20,16 @@ max_batch_size: 4
 checkpoint_path: null
 create_dataset: true
 device: cuda
+
+synthetic_gs_dataset:
+  enabled: false
+  count: 100
+  fixed_noise_seed: 12345
+  prompt_seed: 12345
+  nfe: 4
+  coef_std: 0.01
+  t_couple_std: 0.01
+  include_t_couple: true
+  include_timesteps: true
+  t_std: 0.005
+  prompts: null

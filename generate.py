@@ -1,6 +1,7 @@
 import os
 import re
 from functools import partial
+from typing import Any, Dict, List, Optional
 
 import hydra
 import numpy as np
@@ -66,6 +67,46 @@ def parse_int_list(s):
     return ranges
 
 
+def parse_prompts_list(prompts: Optional[Any]) -> Optional[List[str]]:
+    if prompts is None:
+        return None
+    if isinstance(prompts, list):
+        return [str(p).strip() for p in prompts if str(p).strip()]
+    return [p.strip() for p in str(prompts).split("|") if p.strip()]
+
+
+def sample_manual_gs_params(
+    gs_wrapper,
+    batch_size: int,
+    device: torch.device,
+    cfg: DictConfig,
+) -> Dict[str, torch.Tensor]:
+    coef_std = float(getattr(cfg, "coef_std", 0.01))
+    t_couple_std = float(getattr(cfg, "t_couple_std", coef_std))
+    t_std = float(getattr(cfg, "t_std", coef_std))
+    include_t_couple = bool(getattr(cfg, "include_t_couple", True))
+    include_timesteps = bool(getattr(cfg, "include_timesteps", False))
+
+    steps = int(gs_wrapper.steps)
+    order = int(gs_wrapper.order)
+    params = {}
+
+    for i in range(1, order + 1):
+        params[f"a{i}_diff"] = torch.randn(batch_size, steps, device=device) * coef_std
+        params[f"c{i}_diff"] = torch.randn(batch_size, steps, device=device) * coef_std
+
+    if include_t_couple:
+        params["t_couple"] = torch.randn(batch_size, steps, device=device) * t_couple_std
+
+    if include_timesteps:
+        base_t = torch.linspace(1.0, gs_wrapper.t_eps, steps + 1, device=device).flip(0)
+        base_logits = gs_wrapper.get_inv_t_steps(base_t).reshape(1, -1).repeat(batch_size, 1)
+        logits = base_logits + torch.randn_like(base_logits) * t_std
+        params["timesteps"] = gs_wrapper.get_mu_t_steps(logits).flip(1)
+
+    return params
+
+
 # ----------------------------------------------------------------------------
 
 
@@ -106,6 +147,22 @@ def main(config: DictConfig):
         config.student_solver if gs_solver else config.teacher_solver
     )
     
+    synthetic_cfg = config.get("synthetic_gs_dataset", None)
+    use_synthetic_gs = bool(getattr(synthetic_cfg, "enabled", False))
+
+    if use_synthetic_gs and not gs_solver:
+        raise ValueError("synthetic_gs_dataset mode requires checkpoint_path (GS solver).")
+
+    if use_synthetic_gs:
+        synthetic_count = int(getattr(synthetic_cfg, "count", 100))
+        fixed_noise_seed = int(getattr(synthetic_cfg, "fixed_noise_seed", 0))
+        seeds = list(range(synthetic_count))
+        num_batches = (
+            (len(seeds) - 1) // (max_batch_size * dist.get_world_size()) + 1
+        ) * dist.get_world_size()
+        all_batches = torch.as_tensor(seeds).tensor_split(num_batches)
+        rank_batches = all_batches[dist.get_rank() :: dist.get_world_size()]
+
     num_steps = solver_config.steps # !
     # assert (num_steps is None) != (
     #     solver_config.steps is None
@@ -120,8 +177,13 @@ def main(config: DictConfig):
     # Generating using GS checkpoint.
     if gs_solver:
         config.loss_config.loss_type = "GS"
-        solver_config.steps = num_steps
-        solver_config.order = num_steps
+        if use_synthetic_gs:
+            nfe = int(getattr(synthetic_cfg, "nfe", 4))
+            solver_config.steps = nfe
+            solver_config.order = nfe
+        else:
+            solver_config.steps = num_steps
+            solver_config.order = num_steps
 
         gs_wrapper = get_gs_wrapper(model, config)
         gs_wrapper.load_checkpoint(checkpoint_path=checkpoint_path)
@@ -140,6 +202,35 @@ def main(config: DictConfig):
         torch.distributed.barrier()
 
     shape = [None, model.image_channels, model.image_size, model.image_size]
+    fixed_noise = None
+    prompts_override = None
+    if use_synthetic_gs:
+        fixed_noise_gen = torch.Generator(device=device).manual_seed(
+            fixed_noise_seed % (1 << 32)
+        )
+        fixed_noise = torch.randn(
+            [1, model.image_channels, model.image_size, model.image_size],
+            generator=fixed_noise_gen,
+            device=device,
+        )
+
+        prompts_override = parse_prompts_list(getattr(synthetic_cfg, "prompts", None))
+        if prompts_override is None:
+            prompts_path = getattr(model_config, "prompts_path", None)
+            if prompts_path is None:
+                raise ValueError("synthetic_gs_dataset needs prompts or model.prompts_path.")
+            with open(prompts_path, "r", encoding="utf-8") as f:
+                prompts_override = [line.strip() for line in f if line.strip()]
+        if len(prompts_override) < len(seeds):
+            raise ValueError(
+                f"Not enough prompts ({len(prompts_override)}) for {len(seeds)} samples."
+            )
+        prompt_seed = getattr(synthetic_cfg, "prompt_seed", None)
+        if prompt_seed is not None:
+            prompt_rng = np.random.default_rng(int(prompt_seed))
+            perm = prompt_rng.permutation(len(prompts_override))
+            prompts_override = [prompts_override[i] for i in perm]
+        prompts_override = prompts_override[: len(seeds)]
 
     # Loop over batches.
     dist.print0(f'Generating {len(seeds)} images to "{outdir}"...')
@@ -155,16 +246,34 @@ def main(config: DictConfig):
         shape[0] = batch_size
 
         # Pick latents and labels.
-        rnd = StackedRandomGenerator(device, batch_seeds)
-        noise = rnd.randn(shape, device=device)
+        if use_synthetic_gs:
+            noise = fixed_noise.repeat(batch_size, 1, 1, 1)
+        else:
+            rnd = StackedRandomGenerator(device, batch_seeds)
+            noise = rnd.randn(shape, device=device)
 
         condition = None
         if model_config.conditional:
-            condition = model.iterate_condition(batch_seeds.tolist())
+            if use_synthetic_gs:
+                condition = [prompts_override[int(i)] for i in batch_seeds.tolist()]
+            else:
+                condition = model.iterate_condition(batch_seeds.tolist())
 
         # Generate images.
         with torch.no_grad():
-            latents, images = sampler_fn(noise=noise, condition=condition)
+            manual_solver_params = None
+            if use_synthetic_gs:
+                manual_solver_params = sample_manual_gs_params(
+                    gs_wrapper=gs_wrapper,
+                    batch_size=batch_size,
+                    device=device,
+                    cfg=synthetic_cfg,
+                )
+            latents, images = sampler_fn(
+                noise=noise,
+                condition=condition,
+                manual_solver_params=manual_solver_params,
+            )
 
         if create_dataset:
             latents = [None] * batch_size if latents is None else latents
@@ -183,6 +292,10 @@ def main(config: DictConfig):
                     if isinstance(condition, torch.Tensor)
                     else condition
                 ),
+                "manual_solver_params": {
+                    k: (v.detach().cpu() if isinstance(v, torch.Tensor) else v)
+                    for k, v in (manual_solver_params or {}).items()
+                },
             }
             torch.save(dataset, os.path.join(synt_dir, f"{batch_seeds[0]}.pt"))
 

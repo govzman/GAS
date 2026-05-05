@@ -1,3 +1,4 @@
+import contextlib
 import lpips
 
 import torch
@@ -812,6 +813,32 @@ class GSWrapper(nn.Module):
         )
         return solver
     
+    @contextlib.contextmanager
+    def _manual_solver_params_context(self, manual_solver_params: Optional[dict]):
+        if not manual_solver_params:
+            yield
+            return
+
+        original_values = {}
+        for key, value in manual_solver_params.items():
+            if key == "timesteps":
+                continue
+            if hasattr(self.solver, key):
+                original_values[key] = getattr(self.solver, key)
+            setattr(self.solver, key, value)
+
+        original_get_time_steps = self.solver.get_time_steps
+        if "timesteps" in manual_solver_params and manual_solver_params["timesteps"] is not None:
+            manual_timesteps = manual_solver_params["timesteps"]
+            self.solver.get_time_steps = lambda *args, **kwargs: manual_timesteps
+
+        try:
+            yield
+        finally:
+            self.solver.get_time_steps = original_get_time_steps
+            for key, value in original_values.items():
+                setattr(self.solver, key, value)
+
     def student_sampler_fn(self, noise: torch.Tensor, **kwargs) -> Tuple[Optional[torch.Tensor], torch.Tensor]:
         """Calls `sample` method of the Generalised Solver. 
         
@@ -823,23 +850,25 @@ class GSWrapper(nn.Module):
             torch.tensor: Sampled images
         """
         cond_emb = getattr(self.model.model_fn, "condition", None)
+        manual_solver_params = kwargs.pop("manual_solver_params", None)
             
-        if self.coef_prediction_mode == "all_at_once":
-            self._update_dynamic_t_couple(noise=noise, cond_emb=cond_emb)
-            self._update_dynamic_ac_coefs(noise=noise, cond_emb=cond_emb)
+        with self._manual_solver_params_context(manual_solver_params):
+            if manual_solver_params is None and self.coef_prediction_mode == "all_at_once":
+                self._update_dynamic_t_couple(noise=noise, cond_emb=cond_emb)
+                self._update_dynamic_ac_coefs(noise=noise, cond_emb=cond_emb)
 
-        before_step_fn = None
-        if self.coef_prediction_mode == "step_wise":
-            def before_step_fn(step_idx: int, x: torch.Tensor) -> None:
-                self._update_dynamic_t_couple(noise=x, cond_emb=cond_emb, step_idx=step_idx)
-                self._update_dynamic_ac_coefs(noise=x, cond_emb=cond_emb, step_idx=step_idx)
+            before_step_fn = None
+            if manual_solver_params is None and self.coef_prediction_mode == "step_wise":
+                def before_step_fn(step_idx: int, x: torch.Tensor) -> None:
+                    self._update_dynamic_t_couple(noise=x, cond_emb=cond_emb, step_idx=step_idx)
+                    self._update_dynamic_ac_coefs(noise=x, cond_emb=cond_emb, step_idx=step_idx)
 
-        images = self.solver.sample(
-            x=noise,
-            steps=self.steps,
-            order=self.order,
-            before_step_fn=before_step_fn,
-        )
+            images = self.solver.sample(
+                x=noise,
+                steps=self.steps,
+                order=self.order,
+                before_step_fn=before_step_fn,
+            )
         return None, images
     
     # training function
@@ -924,6 +953,7 @@ class GSWrapperLatent(GSWrapper):
         noise: torch.Tensor,
         decode: bool = False,
         condition: Any = None,
+        manual_solver_params: Optional[dict] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Calls `sample` method of the Generalised Solver. 
         
@@ -940,22 +970,23 @@ class GSWrapperLatent(GSWrapper):
             self.model.set_condition(condition)
         cond_emb = getattr(self.model.model_fn, "condition", None)
         
-        if self.coef_prediction_mode == "all_at_once":
-            self._update_dynamic_t_couple(noise=noise, cond_emb=cond_emb)
-            self._update_dynamic_ac_coefs(noise=noise, cond_emb=cond_emb)
+        with self._manual_solver_params_context(manual_solver_params):
+            if manual_solver_params is None and self.coef_prediction_mode == "all_at_once":
+                self._update_dynamic_t_couple(noise=noise, cond_emb=cond_emb)
+                self._update_dynamic_ac_coefs(noise=noise, cond_emb=cond_emb)
 
-        before_step_fn = None
-        if self.coef_prediction_mode == "step_wise":
-            def before_step_fn(step_idx: int, x: torch.Tensor) -> None:
-                self._update_dynamic_t_couple(noise=x, cond_emb=cond_emb, step_idx=step_idx)
-                self._update_dynamic_ac_coefs(noise=x, cond_emb=cond_emb, step_idx=step_idx)
+            before_step_fn = None
+            if manual_solver_params is None and self.coef_prediction_mode == "step_wise":
+                def before_step_fn(step_idx: int, x: torch.Tensor) -> None:
+                    self._update_dynamic_t_couple(noise=x, cond_emb=cond_emb, step_idx=step_idx)
+                    self._update_dynamic_ac_coefs(noise=x, cond_emb=cond_emb, step_idx=step_idx)
 
-        latents = self.solver.sample(
-            x=noise,
-            steps=self.steps,
-            order=self.order,
-            before_step_fn=before_step_fn,
-        )
+            latents = self.solver.sample(
+                x=noise,
+                steps=self.steps,
+                order=self.order,
+                before_step_fn=before_step_fn,
+            )
 
         if decode:
             images = self.model.decode(latents)
