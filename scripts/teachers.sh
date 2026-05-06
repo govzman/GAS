@@ -47,7 +47,9 @@ torchrun --standalone --nproc_per_node=1 generate.py \
     outdir="'data/teachers/sd-v1/nfe=${NFE}'" \
     seeds="00000-01449" \
     max_batch_size=4 \
-    create_dataset=True
+    create_dataset=True \
+    teacher_solver.steps=${NFE} \
+    teacher_solver.order=$((NFE-1))
 
 echo "Collate SD nfe=${NFE}"
 python collate.py \

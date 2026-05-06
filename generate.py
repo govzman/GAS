@@ -175,11 +175,15 @@ def main(config: DictConfig):
         config.loss_config.loss_type = "GS"
         if use_synthetic_gs:
             nfe = int(getattr(synthetic_cfg, "nfe", 4))
+            # For NFE=K, use coefficients up to K-1 by default (a1..a(K-1), c1..c(K-1)).
+            # This can be overridden via synthetic_gs_dataset.order.
+            synth_order = int(getattr(synthetic_cfg, "order", max(1, nfe - 1)))
             solver_config.steps = nfe
-            solver_config.order = nfe
+            solver_config.order = min(synth_order, nfe)
         else:
             solver_config.steps = num_steps
-            solver_config.order = num_steps
+            # Keep configured order (e.g. teacher order=3) unless it exceeds steps.
+            solver_config.order = min(int(solver_config.order), int(solver_config.steps))
 
         gs_wrapper = get_gs_wrapper(model, config)
         if checkpoint_path is not None:

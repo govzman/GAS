@@ -27,6 +27,7 @@ synthetic_gs_dataset:
   fixed_noise_seed: 12345
   prompt_seed: 12345
   nfe: 4
+  order: 3
   coef_std: 0.01
   t_couple_std: 0.01
   include_t_couple: true
