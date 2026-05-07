@@ -12,6 +12,35 @@ loss_config:
   disc_weight: 1
   disc_type: latent_4
   disc_lr: 0.00001
+  hpsv2:
+    enabled: false
+    reward_scale: 1.0
+    grad_mode: backprop
+    reinforce:
+      baseline: batch_mean
+      ema_beta: 0.99
+      entropy_weight: 0.0
+
+solver_param_conditioning:
+  enabled: false
+  mode: global_per_sample
+  input: latent_state
+  feature_dim: 256
+  hidden_dim: 512
+  predict:
+    a_diff: true
+    c_diff: true
+    t_couple: true
+    timesteps: false
+  init:
+    output_zero: true
+  clamp:
+    enabled: true
+    max_abs: 0.1
+  stochastic:
+    enabled: false
+    fixed_std: 0.01
+    learn_std: false
 
 # model: src/model/coco
 outdir: "data/teachers/sd-v1/nfe=5"

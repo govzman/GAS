@@ -35,15 +35,16 @@ def evaluate_wrapper(
         if k not in NOT_LOG_KEYS:
             d_res[f"vis_stat/{k}{suff}"] = v.mean().item()
 
-    if "x0_s" not in out_d:
-        out_d["x0_s"] = gs_wrapper.model.decode(out_d["latents_s"])
-    log_end_img(
-        exp,
-        out_d["x0_s"],
-        out_d["x0_t"],
-        global_step=global_step,
-        key=f"vis_stat{suff}/backward_end_inter",
-    )
+    if "x0_t" in out_d:
+        if "x0_s" not in out_d:
+            out_d["x0_s"] = gs_wrapper.model.decode(out_d["latents_s"])
+        log_end_img(
+            exp,
+            out_d["x0_s"],
+            out_d["x0_t"],
+            global_step=global_step,
+            key=f"vis_stat{suff}/backward_end_inter",
+        )
 
     log_d = defaultdict(float)
     num_elements = 0
@@ -61,12 +62,13 @@ def evaluate_wrapper(
             d_res[f"val_stat/{k}{suff}"] = v / num_elements
 
     exp.log_metrics(d_res, step=global_step)
-    if "x0_s" not in out_d:
-        out_d["x0_s"] = gs_wrapper.model.decode(out_d["latents_s"])
-    log_end_img(
-        exp,
-        out_d["x0_s"],
-        out_d["x0_t"],
-        global_step=global_step,
-        key=f"val_stat{suff}/backward_end_inter",
-    )
+    if "x0_t" in out_d:
+        if "x0_s" not in out_d:
+            out_d["x0_s"] = gs_wrapper.model.decode(out_d["latents_s"])
+        log_end_img(
+            exp,
+            out_d["x0_s"],
+            out_d["x0_t"],
+            global_step=global_step,
+            key=f"val_stat{suff}/backward_end_inter",
+        )

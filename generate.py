@@ -207,6 +207,11 @@ def main(config: DictConfig):
     if dist.get_rank() == 0:
         torch.distributed.barrier()
 
+    dist.print0(
+        f"Generation setup: gs_solver={gs_solver}, synthetic_gs={use_synthetic_gs}, "
+        f"steps(NFE)={solver_config.steps}, order={solver_config.order}, outdir={outdir}"
+    )
+
     shape = [None, model.image_channels, model.image_size, model.image_size]
     fixed_noise = None
     prompts_override = None

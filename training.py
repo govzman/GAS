@@ -187,13 +187,14 @@ def train(
                 if "x0_s" not in res_d:
                     with torch.no_grad():
                         res_d["x0_s"] = gs_wrapper.model.decode(res_d["latents_s"])
-                log_end_img(
-                    exp,
-                    res_d["x0_s"],
-                    res_d["x0_t"],
-                    global_step=global_step,
-                    key="train/backward_end_inter",
-                )
+                if "x0_t" in res_d:
+                    log_end_img(
+                        exp,
+                        res_d["x0_s"],
+                        res_d["x0_t"],
+                        global_step=global_step,
+                        key="train/backward_end_inter",
+                    )
 
                 evaluate_wrapper(
                     exp=exp,

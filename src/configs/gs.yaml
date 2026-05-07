@@ -40,6 +40,35 @@ loss_config:
   use_repa_in_eval: false
   repa_log_per_layer: false
   repa_pretrained: true
+  hpsv2:
+    enabled: false
+    reward_scale: 1.0
+    grad_mode: backprop
+    reinforce:
+      baseline: batch_mean
+      ema_beta: 0.99
+      entropy_weight: 0.0
+
+solver_param_conditioning:
+  enabled: false
+  mode: global_per_sample # static | global_per_sample | per_step
+  input: latent_state
+  feature_dim: 256
+  hidden_dim: 512
+  predict:
+    a_diff: true
+    c_diff: true
+    t_couple: true
+    timesteps: false
+  init:
+    output_zero: true
+  clamp:
+    enabled: true
+    max_abs: 0.1
+  stochastic:
+    enabled: false
+    fixed_std: 0.01
+    learn_std: false
   
 trainer:
   n_iters: 5000

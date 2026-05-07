@@ -14,6 +14,8 @@ from src.model.gas.generalized_solver import GeneralizedSolver
 from src.model.gas.adversarial_module.dist_adv_loss import DistAdversarialTraining
 from src.model.gas.synt_data import SyntDataType
 from src.model.gas.stepwise_predictors import create_stepwise_predictor
+from src.model.gas.solver_param_predictor import SolverParamPredictor
+from src.loss.hpsv2_reward import HPSv2RewardLoss
 
 
 def _final_linear_scheduler_transformer(module: nn.Module) -> Optional[nn.Linear]:
@@ -186,9 +188,47 @@ class GSWrapper(nn.Module):
             )
             self.repa_loss.eval()
 
-        assert self.loss_config.loss_type in ["GS", "GAS"]
+        assert self.loss_config.loss_type in ["GS", "GAS", "HPSv2"]
         if self.loss_config.loss_type == "GAS":
             self.adv_loss = DistAdversarialTraining(self.loss_config)
+        self.hps_reward = None
+        self.hps_cfg = getattr(self.loss_config, "hpsv2", None)
+        if self.loss_config.loss_type == "HPSv2":
+            if self.hps_cfg is None or not bool(getattr(self.hps_cfg, "enabled", False)):
+                raise ValueError("For loss_type=HPSv2 set loss_config.hpsv2.enabled=true")
+            self.hps_reward = HPSv2RewardLoss(
+                reward_scale=float(getattr(self.hps_cfg, "reward_scale", 1.0))
+            )
+
+        self.solver_param_conditioning_cfg = getattr(config, "solver_param_conditioning", None)
+        self.solver_param_conditioning_enabled = bool(
+            self.solver_param_conditioning_cfg is not None
+            and getattr(self.solver_param_conditioning_cfg, "enabled", False)
+        )
+        self.solver_param_conditioning_mode = "static"
+        self.solver_param_predictor = None
+        self._last_reinforce_log_prob = None
+        self._last_reinforce_entropy = None
+        if self.solver_param_conditioning_enabled:
+            self.solver_param_conditioning_mode = str(
+                getattr(self.solver_param_conditioning_cfg, "mode", "global_per_sample")
+            )
+            pred_cfg = getattr(self.solver_param_conditioning_cfg, "predict", None)
+            clamp_cfg = getattr(self.solver_param_conditioning_cfg, "clamp", None)
+            stoch_cfg = getattr(self.solver_param_conditioning_cfg, "stochastic", None)
+            self.solver_param_predictor = SolverParamPredictor(
+                steps=int(self.solver_config.steps),
+                order=int(self.solver_config.order),
+                feature_dim=int(getattr(self.solver_param_conditioning_cfg, "feature_dim", 256)),
+                hidden_dim=int(getattr(self.solver_param_conditioning_cfg, "hidden_dim", 512)),
+                predict_a_diff=bool(getattr(pred_cfg, "a_diff", True)) if pred_cfg is not None else True,
+                predict_c_diff=bool(getattr(pred_cfg, "c_diff", True)) if pred_cfg is not None else True,
+                predict_t_couple=bool(getattr(pred_cfg, "t_couple", True)) if pred_cfg is not None else True,
+                clamp_enabled=bool(getattr(clamp_cfg, "enabled", True)) if clamp_cfg is not None else True,
+                clamp_max_abs=float(getattr(clamp_cfg, "max_abs", 0.1)) if clamp_cfg is not None else 0.1,
+                stochastic_enabled=bool(getattr(stoch_cfg, "enabled", False)) if stoch_cfg is not None else False,
+                stochastic_fixed_std=float(getattr(stoch_cfg, "fixed_std", 0.01)) if stoch_cfg is not None else 0.01,
+            )
 
         # setup solver
         solver = self.get_base_solver()
@@ -541,6 +581,26 @@ class GSWrapper(nn.Module):
         
         # end init solver
         self.solver = solver
+
+    def _predict_solver_params(self, x: torch.Tensor, cond_emb: Optional[torch.Tensor]) -> Dict[str, torch.Tensor]:
+        if self.solver_param_predictor is None:
+            return {}
+        features = SolverParamPredictor.features_from_latent_and_condition(
+            x=x,
+            cond_emb=cond_emb,
+            feature_dim=int(getattr(self.solver_param_conditioning_cfg, "feature_dim", 256)),
+        )
+        sampled, log_prob, entropy = self.solver_param_predictor.sample_with_logprob(features)
+        self._last_reinforce_log_prob = log_prob
+        self._last_reinforce_entropy = entropy
+        return sampled
+
+    def _apply_solver_params(self, solver_params: Dict[str, torch.Tensor]) -> None:
+        for key, value in solver_params.items():
+            if key == "timesteps":
+                continue
+            if hasattr(self.solver, key):
+                setattr(self.solver, key, value)
     
     def _get_shuffled_inputs_for_coefficients(
         self, 
@@ -914,12 +974,20 @@ class GSWrapper(nn.Module):
         manual_solver_params = kwargs.pop("manual_solver_params", None)
             
         with self._manual_solver_params_context(manual_solver_params):
-            if manual_solver_params is None and self.coef_prediction_mode == "all_at_once":
-                self._update_dynamic_t_couple(noise=noise, cond_emb=cond_emb)
-                self._update_dynamic_ac_coefs(noise=noise, cond_emb=cond_emb)
+            if manual_solver_params is None:
+                if self.solver_param_conditioning_enabled:
+                    if self.solver_param_conditioning_mode != "per_step":
+                        self._apply_solver_params(self._predict_solver_params(noise, cond_emb))
+                elif self.coef_prediction_mode == "all_at_once":
+                    self._update_dynamic_t_couple(noise=noise, cond_emb=cond_emb)
+                    self._update_dynamic_ac_coefs(noise=noise, cond_emb=cond_emb)
 
             before_step_fn = None
-            if manual_solver_params is None and self.coef_prediction_mode == "step_wise":
+            if manual_solver_params is None and self.solver_param_conditioning_enabled and self.solver_param_conditioning_mode == "per_step":
+                def before_step_fn(step_idx: int, x: torch.Tensor) -> None:
+                    _ = step_idx
+                    self._apply_solver_params(self._predict_solver_params(x, cond_emb))
+            elif manual_solver_params is None and self.coef_prediction_mode == "step_wise":
                 def before_step_fn(step_idx: int, x: torch.Tensor) -> None:
                     self._update_dynamic_t_couple(noise=x, cond_emb=cond_emb, step_idx=step_idx)
                     self._update_dynamic_ac_coefs(noise=x, cond_emb=cond_emb, step_idx=step_idx)
@@ -951,7 +1019,7 @@ class GSWrapper(nn.Module):
         """
         assert len(batch) in (4, 5), f"len(batch) expected 4 or 5, got {len(batch)}"
         gt_solver_params = batch[4] if len(batch) == 5 else None
-        noise, images, _, _ = batch[:4]
+        noise, images, _, condition = batch[:4]
 
         d = {}
         if return_timesteps:
@@ -963,13 +1031,21 @@ class GSWrapper(nn.Module):
         cond_emb = getattr(self.model.model_fn, "condition", None)
         self._add_gt_solver_metrics(d, gt_solver_params, noise, cond_emb)
 
-        d['loss_l1'] = torch.abs(student_images - images).mean((1, 2, 3))
-        d['loss_l2'] = torch.square(student_images - images).mean((1, 2, 3))
+        if self.loss_config.loss_type == "HPSv2":
+            if not isinstance(condition, list):
+                raise ValueError("HPSv2 reward mode expects condition to be list[str] prompts.")
+            reward_vals = self.hps_reward.reward(student_images, condition, grad=True)
+            d["reward_hpsv2"] = reward_vals
+            d["loss_hpsv2"] = -reward_vals * float(getattr(self.hps_cfg, "reward_scale", 1.0))
+            d["x0_s"] = self.interpolate_lpips(student_images)
+        else:
+            d['loss_l1'] = torch.abs(student_images - images).mean((1, 2, 3))
+            d['loss_l2'] = torch.square(student_images - images).mean((1, 2, 3))
 
-        d['x0_s'] = self.interpolate_lpips(student_images)
-        d['x0_t'] = self.interpolate_lpips(images)
+            d['x0_s'] = self.interpolate_lpips(student_images)
+            d['x0_t'] = self.interpolate_lpips(images)
 
-        d['loss_lpips'] = self.loss_fn_vgg(d['x0_s'], d['x0_t']).flatten(0)
+            d['loss_lpips'] = self.loss_fn_vgg(d['x0_s'], d['x0_t']).flatten(0)
 
         if self.loss_config.loss_type == 'GAS':
             # disctiminator step optim
@@ -1002,7 +1078,10 @@ class GSWrapper(nn.Module):
                 ({d['gen_loss_adv'].shape} vs {d[self.loss_config.loss_key].shape}).
             """
 
-        d['loss_total'] = self.loss_config.disc_weight * d.get('gen_loss_adv', 0.) + d[self.loss_config.loss_key]
+        if self.loss_config.loss_type == "HPSv2":
+            d["loss_total"] = d["loss_hpsv2"]
+        else:
+            d['loss_total'] = self.loss_config.disc_weight * d.get('gen_loss_adv', 0.) + d[self.loss_config.loss_key]
 
         return d
     
@@ -1075,10 +1154,20 @@ class GSWrapperLatent(GSWrapper):
         cond_emb = getattr(self.model.model_fn, "condition", None)
         self._add_gt_solver_metrics(d, gt_solver_params, noise, cond_emb)
 
-        d['loss_l1_latents'] = torch.abs(latents - student_latents).mean((1, 2, 3))
-        d['loss_l2_latents'] = torch.square(latents - student_latents).mean((1, 2, 3))
-        d['x0_t'] = self.interpolate_lpips(images)
-        d['latents_s'] = student_latents
+        if self.loss_config.loss_type == "HPSv2":
+            if not isinstance(condition, list):
+                raise ValueError("HPSv2 reward mode expects text prompts in batch condition.")
+            student_images = self.model.decode(student_latents)
+            reward_vals = self.hps_reward.reward(student_images, condition, grad=True)
+            d["reward_hpsv2"] = reward_vals
+            d["loss_hpsv2"] = -reward_vals * float(getattr(self.hps_cfg, "reward_scale", 1.0))
+            d["x0_s"] = self.interpolate_lpips(student_images)
+            d["latents_s"] = student_latents
+        else:
+            d['loss_l1_latents'] = torch.abs(latents - student_latents).mean((1, 2, 3))
+            d['loss_l2_latents'] = torch.square(latents - student_latents).mean((1, 2, 3))
+            d['x0_t'] = self.interpolate_lpips(images)
+            d['latents_s'] = student_latents
 
         apply_repa = self.use_repa and self.repa_loss is not None and (
             is_train or self.use_repa_in_eval
@@ -1128,14 +1217,42 @@ class GSWrapperLatent(GSWrapper):
 
             assert d['gen_loss_adv'].shape == d[self.loss_config.loss_key].shape, f"SHAPE = {d['gen_loss_adv'].shape}, {d[self.loss_config.loss_key].shape}"
 
-        base_loss = d[self.loss_config.loss_key]
-        adv_part = self.loss_config.disc_weight * d.get("gen_loss_adv", 0.0)
-        repa_part = torch.tensor(
-            0.0, device=base_loss.device, dtype=base_loss.dtype
-        )
-        if self.use_repa and self.repa_loss is not None and "loss_repa" in d:
-            rw = float(getattr(self.loss_config, "repa_weight", 0.5))
-            repa_part = rw * d["loss_repa"].to(device=base_loss.device, dtype=base_loss.dtype)
-        d["loss_total"] = adv_part + base_loss + repa_part
+        if self.loss_config.loss_type == "HPSv2":
+            base_loss = d["loss_hpsv2"]
+            grad_mode = str(getattr(self.hps_cfg, "grad_mode", "backprop"))
+            if grad_mode == "reinforce":
+                lp = self._last_reinforce_log_prob
+                if lp is None:
+                    raise RuntimeError(
+                        "REINFORCE requested but predictor did not produce log_prob. "
+                        "Enable solver_param_conditioning.stochastic.enabled=true."
+                    )
+                reward = d["reward_hpsv2"].detach()
+                baseline_cfg = getattr(self.hps_cfg, "reinforce", None)
+                baseline_mode = "batch_mean" if baseline_cfg is None else str(getattr(baseline_cfg, "baseline", "batch_mean"))
+                if baseline_mode == "batch_mean":
+                    baseline = reward.mean()
+                else:
+                    baseline = reward.mean()
+                advantage = reward - baseline
+                policy_loss = -(advantage * lp).mean()
+                entropy_weight = 0.0 if baseline_cfg is None else float(getattr(baseline_cfg, "entropy_weight", 0.0))
+                entropy_term = torch.tensor(0.0, device=policy_loss.device, dtype=policy_loss.dtype)
+                if self._last_reinforce_entropy is not None and entropy_weight > 0:
+                    entropy_term = -entropy_weight * self._last_reinforce_entropy.mean()
+                d["loss_reinforce"] = policy_loss + entropy_term
+                d["loss_total"] = d["loss_hpsv2"] + d["loss_reinforce"]
+            else:
+                d["loss_total"] = base_loss
+        else:
+            base_loss = d[self.loss_config.loss_key]
+            adv_part = self.loss_config.disc_weight * d.get("gen_loss_adv", 0.0)
+            repa_part = torch.tensor(
+                0.0, device=base_loss.device, dtype=base_loss.dtype
+            )
+            if self.use_repa and self.repa_loss is not None and "loss_repa" in d:
+                rw = float(getattr(self.loss_config, "repa_weight", 0.5))
+                repa_part = rw * d["loss_repa"].to(device=base_loss.device, dtype=base_loss.dtype)
+            d["loss_total"] = adv_part + base_loss + repa_part
 
         return d

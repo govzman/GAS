@@ -1,0 +1,228 @@
+# Cursor task: add optional HPSv2 reward training + optional image-/trajectory-conditional GS coefficients (a/c/t_couple[/timesteps]) — fully backward compatible via config
+
+## Project context (important)
+This repo is based on GAS/GS (ICLR 2026 “GAS: Improving Discretization of Diffusion ODEs via Generalized Adversarial Solver”).
+Baseline idea in paper/code: **distill** a few-step *student solver* (learn θ schedule + φ coeff corrections + ξ timestep coupling) to match a *teacher solver* output using LPIPS/L1 (+ optional adversarial).
+
+### My custom modification (must be preserved)
+All my recent additions attempt a new idea: **make solver parameters depend on the generated image**.
+Operationally this means: coefficients/corrections `a_diff`, `c_diff`, `t_couple` (and optionally `timesteps`) should be **predicted per sample** and possibly **per solver step** based on the sampling trajectory (latent states), instead of being a single static learned tensor shared by all samples.
+
+In my code there is already a notion of `manual_solver_params` dict with keys like:
+- `a1_diff`, `a2_diff`, `a3_diff` (shape [B, steps])
+- `c1_diff`, `c2_diff`, `c3_diff` (shape [B, steps])
+- `t_couple` (shape [B, steps])
+- `timesteps` (shape [B, steps+1])
+This is used in synthetic dataset generation; we should reuse this interface if possible.
+
+## New goal
+I want to **switch the training objective from teacher-student LPIPS/L1 to reward optimization using HPSv2** (Human Preference Score v2), i.e. maximize reward(prompt, image), and optionally keep adversarial loss.
+
+## HARD REQUIREMENT: all new functionality MUST be optional via Hydra config
+- Default configs must keep old behavior working (distillation, teacher, LPIPS/L1).
+- New features are enabled only with explicit flags.
+- Old checkpoints must still load without changes.
+- If a new block is disabled, code path must be identical to current.
+
+---
+
+# Work plan for you (Cursor)
+
+## Step 0 — codebase audit (answer before implementing)
+Locate and report EXACT files/functions for:
+1) Where teacher images are generated during training (and where student images are generated).
+2) Where LPIPS/L1 distillation loss is computed.
+3) Where `manual_solver_params` is passed into the sampler and where it is consumed inside GS step.
+4) Where solver params live today (static `nn.Parameter`? tensors inside wrapper?).
+5) How prompts/conditions are represented in training (strings vs embeddings) for SD/LDM/EDM modes.
+
+Only after you point to exact locations, implement the changes below.
+
+---
+
+# Part A — HPSv2 reward loss (optional)
+
+## A1. Add HPSv2 reward module
+Implement `src/loss/hpsv2_reward.py` (or similar) with:
+- lazy singleton loading of HPSv2 model (avoid reloading per step)
+- correct preprocessing for model input:
+  - handle tensor range [-1,1] vs [0,1]
+  - convert to expected dtype/device
+  - ensure batch scoring works
+
+API:
+```python
+class HPSv2RewardLoss(nn.Module):
+    def __init__(self, reward_scale: float, ...):
+        ...
+    def forward(self, images: torch.Tensor, prompts: list[str]) -> torch.Tensor:
+        # returns scalar loss = -mean(reward) * reward_scale
+```
+
+## A2. Differentiability + fallback (config-driven)
+HPSv2 may or may not backprop cleanly. Add config option:
+
+```yaml
+loss_config:
+  loss_type: "LPIPS" | "L1" | "HPSv2"
+  hpsv2:
+    enabled: false
+    reward_scale: 1.0
+    grad_mode: "backprop" | "reinforce"
+    reinforce:
+      baseline: "batch_mean" | "ema"
+      ema_beta: 0.99
+      entropy_weight: 0.0
+```
+
+Behavior:
+- `grad_mode=backprop`: compute reward with gradients and do standard backprop
+- `grad_mode=reinforce`: use REINFORCE-style estimator
+  - this requires the solver-parameter generator to be stochastic (see Part B stochastic mode)
+  - implement baseline and optional entropy regularization
+
+## A3. Disable teacher dependency in reward mode
+If `loss_type=HPSv2`:
+- do NOT generate teacher images
+- do NOT require teacher dataset
+- training step should only:
+  1) sample noise + prompt/condition
+  2) run student sampler
+  3) decode image
+  4) compute HPSv2 reward loss
+
+Keep distillation mode unchanged for other loss types.
+
+---
+
+# Part B — Make solver params depend on generated image/trajectory (optional)
+
+## B0. Definition (avoid circularity)
+“Depend on generated image” should be implemented as **dependence on trajectory latent states**:
+- either predict all params once from (noise, prompt embedding) = “global per sample”
+- or predict step-wise corrections from current latent `x_n` at each solver step = “per-step / trajectory-conditioned”
+
+This matches the idea “parameters adapt to the evolving sample”.
+
+## B1. Add solver parameter predictor (hypernetwork) — optional
+Add new module: `src/model/gas/solver_param_predictor.py`
+
+Config block:
+```yaml
+solver_param_conditioning:
+  enabled: false
+  mode: "static" | "global_per_sample" | "per_step"
+  input: "noise_prompt" | "latent_state" | "both"
+  feature_dim: 256
+  hidden_dim: 512
+  predict:
+    a_diff: true
+    c_diff: true
+    t_couple: true
+    timesteps: false   # start false; optional later
+  init:
+    output_zero: true  # initialize so predicted diffs are 0 => identical to base solver
+  clamp:
+    enabled: true
+    max_abs: 0.1
+  stochastic:          # needed for reinforce
+    enabled: false
+    fixed_std: 0.01
+    learn_std: false
+```
+
+### Shapes / outputs (must match existing manual_solver_params convention)
+For NFE=steps:
+- `a{i}_diff`: [B, steps]
+- `c{i}_diff`: [B, steps]
+- `t_couple`: [B, steps]
+- if `timesteps` predicted: [B, steps+1] (ensure monotonically decreasing and in (t_eps, 1])
+
+## B2. Integration rule (priority order)
+Sampler should choose solver params in this order:
+1) if `manual_solver_params` passed explicitly (existing feature) → use it
+2) else if `solver_param_conditioning.enabled=true` → run predictor and use its output
+3) else → use current static learned params (existing behavior)
+
+This must be implemented with minimal refactoring and must not change old code paths when disabled.
+
+## B3. Keep theoretical guidance intact
+Do NOT remove base coefficients from DPM-Solver++ guidance. Predictor outputs must be **additive corrections** (diffs), same philosophy as GS paper:
+- base coeffs depend on timesteps
+- learned/predicted diffs add on top
+
+## B4. Per-step mode specifics
+If `mode=per_step`:
+- predictor should be called inside solver loop at each step with features from current latent `x_n` (+ prompt embedding/timestep embedding)
+- it should output only the parameters needed for current step OR output full matrices but indexed at step n (prefer minimal)
+
+Keep compute light (small MLP / small CNN pooling). No UNet training.
+
+---
+
+# Part C — Training loop updates (optional combinations)
+
+## C1. Reward training + conditioned params
+If `loss_type=HPSv2` and `solver_param_conditioning.enabled=true`:
+- student sampler uses predictor-produced params
+- optimize predictor weights (and optionally static solver params if still present; configurable)
+- diffusion model stays frozen
+
+## C2. Optional adversarial loss compatibility
+Keep existing adversarial loss optional:
+```yaml
+adv_config:
+  enabled: false
+  weight: 1.0
+  type: "relativistic" | "standard"
+  real_source: "dataset" | "teacher"
+```
+
+Rules:
+- In distillation mode you can keep current “student vs teacher” adversarial if it exists.
+- In reward mode, teacher may be absent; if `adv_config.enabled=true` then require `real_source=dataset` and implement discriminator vs real images (or error if not available). Default should be OFF.
+
+---
+
+# Part D — Config + backward compatibility
+1) Update Hydra configs to include new blocks with safe defaults:
+   - `loss_config.loss_type` default remains current
+   - `loss_config.hpsv2.enabled=false`
+   - `solver_param_conditioning.enabled=false`
+2) Ensure old checkpoints load:
+   - predictor state dict keys must be optional
+   - no strict loading failures
+3) Ensure old training runs unchanged when new flags are off.
+
+---
+
+# Part E — Minimal acceptance tests (must add)
+Add a small debug / test routine (can be behind config flag) to verify:
+
+1) With all new flags OFF: forward outputs and loss match old behavior (within tolerance).
+2) With `solver_param_conditioning.enabled=true`: predictor outputs correct keys and shapes.
+3) With `loss_type=HPSv2`: training step runs without teacher, returns scalar loss.
+4) Gradient check:
+   - backprop mode: predictor parameters get non-zero grads
+   - reinforce mode: log_prob exists and grads flow to predictor
+
+Example CLI I want to work:
+```bash
+python train.py \
+  loss_config.loss_type=HPSv2 \
+  loss_config.hpsv2.enabled=true \
+  loss_config.hpsv2.grad_mode=backprop \
+  solver_param_conditioning.enabled=true \
+  solver_param_conditioning.mode=per_step \
+  solver_param_conditioning.input=latent_state
+```
+
+---
+
+# Implementation constraints
+- Minimal invasive changes
+- No breaking of existing APIs
+- New code paths guarded behind config flags
+- Clear comments mapping to GS/GAS paper notation (θ schedule, φ coeff diffs, ξ timestep coupling)
+
+Start by answering the Step-0 audit questions with exact code pointers, then propose a concrete patch plan (files + functions), then implement.
