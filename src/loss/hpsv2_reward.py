@@ -3,6 +3,8 @@ from typing import List, Optional, Sequence
 
 import torch
 from torch import nn
+import torch.nn.functional as F
+from torchvision.transforms import ToPILImage
 
 
 _HPS_MODEL = None
@@ -58,7 +60,35 @@ class HPSv2RewardLoss(nn.Module):
         hps = _load_hps_model()
         x = self._to_hps_range(images)
         x = x.to(device=images.device, dtype=images.dtype)
-        scores = hps.score(x, list(prompts))
+        
+        # Конвертируем батч тензоров в список PIL.Image
+        to_pil = ToPILImage()
+        pil_images = []
+        for i in range(x.shape[0]):
+            img = x[i].detach().cpu()
+            pil_images.append(to_pil(img))
+        
+        # Инициализируем модель hpsv2 для получения градиентов
+        import hpsv2.img_score
+        hpsv2.img_score.initialize_model()
+        model = hpsv2.img_score.model_dict['model']
+        preprocess_val = hpsv2.img_score.model_dict['preprocess_val']
+        
+        # Преобразуем PIL в тензоры через preprocess_val
+        images_tensor = torch.stack([preprocess_val(img) for img in pil_images]).to(images.device)
+        
+        # Токенизируем промпты
+        from hpsv2.src.open_clip import get_tokenizer
+        tokenizer = get_tokenizer('ViT-H-14')
+        text_tokens = tokenizer(list(prompts)).to(images.device)
+        
+        # Вычисляем scores с градиентами
+        with torch.cuda.amp.autocast():
+            outputs = model(images_tensor, text_tokens)
+            image_features = outputs["image_features"]
+            text_features = outputs["text_features"]
+            scores = torch.diagonal(image_features @ text_features.T)
+        
         if not isinstance(scores, torch.Tensor):
             scores = torch.as_tensor(scores, device=images.device, dtype=images.dtype)
         scores = scores.reshape(-1).to(device=images.device, dtype=images.dtype)

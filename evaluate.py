@@ -34,10 +34,12 @@ def evaluate_wrapper(
     for k, v in out_d.items():
         if k not in NOT_LOG_KEYS:
             d_res[f"vis_stat/{k}{suff}"] = v.mean().item()
-
+    
+    print("out_d", out_d.keys())
     if "x0_t" in out_d:
         if "x0_s" not in out_d:
             out_d["x0_s"] = gs_wrapper.model.decode(out_d["latents_s"])
+        print(f"DEBUG: x0_s shape = {out_d['x0_s'].shape}, x0_t shape = {out_d['x0_t'].shape}")
         log_end_img(
             exp,
             out_d["x0_s"],

@@ -3,8 +3,8 @@ defaults:
   - scheduler_model: scheduler_transformer
   - writer: cometml
   - datasets: coco
-  - student_solver: sd_student_default
-  - teacher_solver: sd_teacher_default
+  - student_solver: sd_student_baseline
+  - teacher_solver: sd_teacher_generate
 
 loss_config:
   loss_type: "GS"

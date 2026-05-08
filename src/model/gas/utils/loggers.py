@@ -80,15 +80,17 @@ def vis_grid(a: torch.Tensor, ax=None) -> None:
 def log_end_img(
     exp: comet_ml.Experiment, x_s: torch.Tensor, x_t: torch.Tensor, global_step: int = None, key: str = None
 ) -> None:
-    fig, ax = plt.subplots(1, 2, figsize=(10, 5))
-
-    vis_grid(x_s, ax=ax[0])
-    ax[0].axis("off")
-    ax[0].set_title("Student")
-
-    vis_grid(x_t, ax=ax[1])
-    ax[1].axis("off")
-    ax[1].set_title("Teacher")
+    if x_t is None:
+        # логируем только студента
+        fig, ax = plt.subplots(1, 1, figsize=(5,5))
+        vis_grid(x_s, ax=ax)
+        ax.set_title("Student")
+    else:
+        fig, ax = plt.subplots(1, 2, figsize=(10,5))
+        vis_grid(x_s, ax=ax[0])
+        ax[0].set_title("Student")
+        vis_grid(x_t, ax=ax[1])
+        ax[1].set_title("Teacher")
 
     if global_step is None:
         return

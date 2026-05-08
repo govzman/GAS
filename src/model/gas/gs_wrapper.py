@@ -1038,6 +1038,7 @@ class GSWrapper(nn.Module):
             d["reward_hpsv2"] = reward_vals
             d["loss_hpsv2"] = -reward_vals * float(getattr(self.hps_cfg, "reward_scale", 1.0))
             d["x0_s"] = self.interpolate_lpips(student_images)
+            d['x0_t'] = self.interpolate_lpips(images)
         else:
             d['loss_l1'] = torch.abs(student_images - images).mean((1, 2, 3))
             d['loss_l2'] = torch.square(student_images - images).mean((1, 2, 3))
@@ -1161,13 +1162,14 @@ class GSWrapperLatent(GSWrapper):
             reward_vals = self.hps_reward.reward(student_images, condition, grad=True)
             d["reward_hpsv2"] = reward_vals
             d["loss_hpsv2"] = -reward_vals * float(getattr(self.hps_cfg, "reward_scale", 1.0))
-            d["x0_s"] = self.interpolate_lpips(student_images)
-            d["latents_s"] = student_latents
+            d["x0_s"] = self.interpolate_lpips(student_images).cpu()
+            d["x0_t"] = self.interpolate_lpips(images).cpu()
+            d["latents_s"] = student_latents.cpu()
         else:
             d['loss_l1_latents'] = torch.abs(latents - student_latents).mean((1, 2, 3))
             d['loss_l2_latents'] = torch.square(latents - student_latents).mean((1, 2, 3))
-            d['x0_t'] = self.interpolate_lpips(images)
-            d['latents_s'] = student_latents
+            d['x0_t'] = self.interpolate_lpips(images).cpu()
+            d['latents_s'] = student_latents.cpu()
 
         apply_repa = self.use_repa and self.repa_loss is not None and (
             is_train or self.use_repa_in_eval

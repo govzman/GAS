@@ -1,10 +1,10 @@
 teacher_pkl: "data/teachers/sd-v1/nfe=5/dataset.pkl"
-use_latents: true
+use_latents: false
 use_condition: true
 train_size: 4
-batch_size: 2
+batch_size: 1
 dataset_shift: 0
-validation_batch_size: 2
+validation_batch_size: 1
 validation_size: 4
 size_vis: 4
 num_workers: 1

@@ -26,49 +26,28 @@ optimizer_a_params:
 #   eta_min: 0.0
 
 loss_config:
-  loss_type: "HPSv2"
+  loss_type: "GS"
   loss_key: loss_l1_latents
   disc_weight: 1
   disc_type: latent_4
   disc_lr: 0.00001
-
-  hpsv2:
-    enabled: true
-    reward_scale: 1.0
-    grad_mode: backprop
-    reinforce:
-      baseline: batch_mean
-      ema_beta: 0.99
-      entropy_weight: 0.0
-
-solver_param_conditioning:
-  enabled: true
-  mode: global_per_sample # static | global_per_sample | per_step
-  input: latent_state
-  feature_dim: 256
-  hidden_dim: 512
-  predict:
-    a_diff: true
-    c_diff: true
-    t_couple: true
-    timesteps: false
-  init:
-    output_zero: true
-  clamp:
-    enabled: true
-    max_abs: 0.1
-  stochastic:
-    enabled: false
-    fixed_std: 0.01
-    learn_std: false
+  # REPA (DINOv2 alignment); enable with loss_config.use_repa=true
+  use_repa: true
+  repa_weight: 0.2
+  repa_model: dinov2_vitb14
+  repa_loss_type: cosine
+  repa_grad_through_decoder: false
+  use_repa_in_eval: false
+  repa_log_per_layer: true
+  repa_pretrained: true
   
 trainer:
   n_iters: 5000
   epoch_num: 2500
   # Backward compatible: training.py used to read iters_to_accumulate directly.
   # With Accelerate we primarily use accumulation_steps.
-  iters_to_accumulate: 4
-  accumulation_steps: 4
+  iters_to_accumulate: 2
+  accumulation_steps: 2
   # accelerate mixed_precision expects: "no" | "fp16" | "bf16"
   amp: "no"
   ema_decay: 0.999

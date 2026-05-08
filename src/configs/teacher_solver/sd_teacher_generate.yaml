@@ -1,0 +1,5 @@
+steps: 5
+order: 3
+t_eps: 0.001
+guidance_scale: 7.5
+
