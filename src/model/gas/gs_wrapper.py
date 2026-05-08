@@ -61,8 +61,6 @@ class PromptNoiseFiLMMlp(nn.Module):
 
     def __init__(self, out_dim: int, prompt_dim: int = 768, hidden_dim: int = 256, noise_feat_dim: int = 3):
         super().__init__()
-        self.prompt_norm = nn.LayerNorm(prompt_dim)
-        self.noise_norm = nn.LayerNorm(noise_feat_dim)
 
         self.prompt_mlp = nn.Sequential(
             nn.Linear(prompt_dim, hidden_dim),
@@ -80,7 +78,6 @@ class PromptNoiseFiLMMlp(nn.Module):
         nn.init.zeros_(self.film.weight)
         nn.init.zeros_(self.film.bias)
 
-        self.out_norm = nn.LayerNorm(hidden_dim)
         self.head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.SiLU(),
@@ -101,17 +98,13 @@ class PromptNoiseFiLMMlp(nn.Module):
         return torch.stack([mean, std, rms], dim=1)
 
     def forward(self, noise: torch.Tensor, cond_emb: torch.Tensor) -> torch.Tensor:
-        # cond_emb: (B, T, 768) -> pooled (B, 768)
         p = cond_emb.mean(dim=1)
-        # p = self.prompt_norm(p)
         hp = self.prompt_mlp(p)
 
         n = self._noise_stats(noise).to(dtype=hp.dtype, device=hp.device)
-        # n = self.noise_norm(n)
         hn = self.noise_mlp(n)
 
         gamma, beta = self.film(hn).chunk(2, dim=1)
-        # h = self.out_norm(hp * (1.0 + gamma) + beta)
         h = hp * (1.0 + gamma) + beta
         return self.head(h)
     
@@ -163,8 +156,9 @@ class GSWrapper(nn.Module):
             print(f"⚠️ WARNING: Coefficient shuffle enabled - noise: {self.shuffle_coef_noise}, conditioning: {self.shuffle_coef_conditioning}")
         
         # create lpips
-        self.loss_fn_vgg = lpips.LPIPS(net='vgg').requires_grad_(False)
-        self.loss_fn_vgg.eval()
+        self.loss_fn_vgg = None
+        if self.loss_config.loss_type in ("GS", "GAS"):
+            self.loss_fn_vgg = lpips.LPIPS(net='vgg').requires_grad_(False).eval()
 
         # construct loss
         self.loss_config = config.loss_config
@@ -547,8 +541,6 @@ class GSWrapper(nn.Module):
         # ==========================================
         # Residual initialization for conditional a/c
         # ==========================================
-
-        self.coeff_residual_scale = 0.01  # маленькая амплитуда
 
         def zero_last_layer(module):
             if _final_linear_scheduler_transformer(module) is not None:
@@ -1142,6 +1134,9 @@ class GSWrapperLatent(GSWrapper):
         gt_solver_params = batch[4] if len(batch) == 5 else None
         noise, images, latents, condition = batch[:4]
 
+        self._last_reinforce_log_prob = None
+        self._last_reinforce_entropy = None
+
         d = {}
         if return_timesteps:
             if condition is not None:
@@ -1158,18 +1153,33 @@ class GSWrapperLatent(GSWrapper):
         if self.loss_config.loss_type == "HPSv2":
             if not isinstance(condition, list):
                 raise ValueError("HPSv2 reward mode expects text prompts in batch condition.")
+            MAX_LOG_IMAGES = 4
             student_images = self.model.decode(student_latents)
             reward_vals = self.hps_reward.reward(student_images, condition, grad=True)
-            d["reward_hpsv2"] = reward_vals
-            d["loss_hpsv2"] = -reward_vals * float(getattr(self.hps_cfg, "reward_scale", 1.0))
-            d["x0_s"] = self.interpolate_lpips(student_images).cpu()
-            d["x0_t"] = self.interpolate_lpips(images).cpu()
-            d["latents_s"] = student_latents.cpu()
+            d["reward_hpsv2"] = reward_vals.detach().mean()  # для логов без графа
+            d["loss_hpsv2"] = -reward_vals.mean() * float(getattr(self.hps_cfg, "reward_scale", 1.0))
+
+            # Логирование только первых MAX_LOG_IMAGES изображений
+            d["x0_s"] = self.interpolate_lpips(student_images[:MAX_LOG_IMAGES].detach()).to(
+                device="cpu", dtype=torch.float16
+            )
+            d["x0_t"] = self.interpolate_lpips(images[:MAX_LOG_IMAGES].detach()).to(
+                device="cpu", dtype=torch.float16
+            )
+            d["latents_s"] = student_latents[:MAX_LOG_IMAGES].detach().to(
+                device="cpu", dtype=torch.float16
+            )
+            # student_latents и student_images больше не нужны
+            del student_latents, student_images
         else:
             d['loss_l1_latents'] = torch.abs(latents - student_latents).mean((1, 2, 3))
             d['loss_l2_latents'] = torch.square(latents - student_latents).mean((1, 2, 3))
-            d['x0_t'] = self.interpolate_lpips(images).cpu()
-            d['latents_s'] = student_latents.cpu()
+            d['x0_t'] = self.interpolate_lpips(images[:MAX_LOG_IMAGES].detach()).to(
+                device="cpu", dtype=torch.float16
+            )
+            d['latents_s'] = student_latents[:MAX_LOG_IMAGES].detach().to(
+                device="cpu", dtype=torch.float16
+            )
 
         apply_repa = self.use_repa and self.repa_loss is not None and (
             is_train or self.use_repa_in_eval
@@ -1257,4 +1267,5 @@ class GSWrapperLatent(GSWrapper):
                 repa_part = rw * d["loss_repa"].to(device=base_loss.device, dtype=base_loss.dtype)
             d["loss_total"] = adv_part + base_loss + repa_part
 
+        torch.cuda.empty_cache()
         return d
