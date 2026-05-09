@@ -155,13 +155,15 @@ class GSWrapper(nn.Module):
         if self.shuffle_coef_noise or self.shuffle_coef_conditioning:
             print(f"⚠️ WARNING: Coefficient shuffle enabled - noise: {self.shuffle_coef_noise}, conditioning: {self.shuffle_coef_conditioning}")
         
+        # construct loss
+        self.loss_config = config.loss_config
+        
         # create lpips
         self.loss_fn_vgg = None
         if self.loss_config.loss_type in ("GS", "GAS"):
             self.loss_fn_vgg = lpips.LPIPS(net='vgg').requires_grad_(False).eval()
 
-        # construct loss
-        self.loss_config = config.loss_config
+        
 
         # REPA (Representation Alignment, frozen DINOv2)
         self.use_repa = getattr(self.loss_config, "use_repa", False)
@@ -966,9 +968,12 @@ class GSWrapper(nn.Module):
         manual_solver_params = kwargs.pop("manual_solver_params", None)
             
         with self._manual_solver_params_context(manual_solver_params):
+            print('??HERE')
             if manual_solver_params is None:
+                print('!', solver_param_conditioning_enabled, self.solver_param_conditioning_mode)
                 if self.solver_param_conditioning_enabled:
                     if self.solver_param_conditioning_mode != "per_step":
+                        print('HERE')
                         self._apply_solver_params(self._predict_solver_params(noise, cond_emb))
                 elif self.coef_prediction_mode == "all_at_once":
                     self._update_dynamic_t_couple(noise=noise, cond_emb=cond_emb)
@@ -1019,6 +1024,7 @@ class GSWrapper(nn.Module):
             # so pass them explicitly (same behavior as in GSWrapperLatent).
             cond_emb = getattr(self.model.model_fn, "condition", None)
             d['timesteps'] = self.solver.get_time_steps(noise, cond_emb)
+        print('Check!')
         _, student_images = self.student_sampler_fn(noise)
         cond_emb = getattr(self.model.model_fn, "condition", None)
         self._add_gt_solver_metrics(d, gt_solver_params, noise, cond_emb)
@@ -1026,7 +1032,7 @@ class GSWrapper(nn.Module):
         if self.loss_config.loss_type == "HPSv2":
             if not isinstance(condition, list):
                 raise ValueError("HPSv2 reward mode expects condition to be list[str] prompts.")
-            reward_vals = self.hps_reward.reward(student_images, condition, grad=True)
+            reward_vals = self.hps_reward.reward(student_images, condition)
             d["reward_hpsv2"] = reward_vals
             d["loss_hpsv2"] = -reward_vals * float(getattr(self.hps_cfg, "reward_scale", 1.0))
             d["x0_s"] = self.interpolate_lpips(student_images)
@@ -1091,28 +1097,33 @@ class GSWrapperLatent(GSWrapper):
         condition: Any = None,
         manual_solver_params: Optional[dict] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """Calls `sample` method of the Generalised Solver. 
-        
-        Args:
-            noise (torch.Tensor): An initial noise tensor to start sampling process from.
-        
-        Returns:
-            torch.Tensor: Predicted latents that are the direct output of the model.
-            Optional[torch.Tensor]: Predicted images (decoded latents).
-                Not None if decode flag is set True.
-        """
         images = None
         if condition is not None:
             self.model.set_condition(condition)
         cond_emb = getattr(self.model.model_fn, "condition", None)
-        
+
         with self._manual_solver_params_context(manual_solver_params):
-            if manual_solver_params is None and self.coef_prediction_mode == "all_at_once":
-                self._update_dynamic_t_couple(noise=noise, cond_emb=cond_emb)
-                self._update_dynamic_ac_coefs(noise=noise, cond_emb=cond_emb)
+            if manual_solver_params is None:
+                # ---- стохастический предиктор (REINFORCE) ----
+                if self.solver_param_conditioning_enabled:
+                    if self.solver_param_conditioning_mode != "per_step":
+                        self._apply_solver_params(
+                            self._predict_solver_params(noise, cond_emb)
+                        )
+                # ---- прямое предсказание таблиц (all_at_once) ----
+                elif self.coef_prediction_mode == "all_at_once":
+                    self._update_dynamic_t_couple(noise=noise, cond_emb=cond_emb)
+                    self._update_dynamic_ac_coefs(noise=noise, cond_emb=cond_emb)
 
             before_step_fn = None
-            if manual_solver_params is None and self.coef_prediction_mode == "step_wise":
+            # ---- per‑step варианты ----
+            if manual_solver_params is None and self.solver_param_conditioning_enabled \
+                    and self.solver_param_conditioning_mode == "per_step":
+                def before_step_fn(step_idx: int, x: torch.Tensor) -> None:
+                    self._apply_solver_params(
+                        self._predict_solver_params(x, cond_emb)
+                    )
+            elif manual_solver_params is None and self.coef_prediction_mode == "step_wise":
                 def before_step_fn(step_idx: int, x: torch.Tensor) -> None:
                     self._update_dynamic_t_couple(noise=x, cond_emb=cond_emb, step_idx=step_idx)
                     self._update_dynamic_ac_coefs(noise=x, cond_emb=cond_emb, step_idx=step_idx)
@@ -1126,7 +1137,6 @@ class GSWrapperLatent(GSWrapper):
 
         if decode:
             images = self.model.decode(latents)
-
         return latents, images
     
     def forward(self, batch: SyntDataType, return_timesteps: bool = False, is_train: bool = True) -> dict:
@@ -1134,8 +1144,8 @@ class GSWrapperLatent(GSWrapper):
         gt_solver_params = batch[4] if len(batch) == 5 else None
         noise, images, latents, condition = batch[:4]
 
-        self._last_reinforce_log_prob = None
-        self._last_reinforce_entropy = None
+        # self._last_reinforce_log_prob = None
+        # self._last_reinforce_entropy = None
 
         d = {}
         if return_timesteps:
@@ -1155,19 +1165,21 @@ class GSWrapperLatent(GSWrapper):
                 raise ValueError("HPSv2 reward mode expects text prompts in batch condition.")
             MAX_LOG_IMAGES = 4
             student_images = self.model.decode(student_latents)
-            reward_vals = self.hps_reward.reward(student_images, condition, grad=True)
+            reward_vals = self.hps_reward.reward(student_images, condition)
+            # d["reward_hpsv2"] = float(reward_vals.detach().mean().cpu())
+            # d["loss_hpsv2"]   = -float(reward_vals.mean().cpu()) * float(getattr(self.hps_cfg, "reward_scale", 1.0))
             d["reward_hpsv2"] = reward_vals.detach().mean()  # для логов без графа
             d["loss_hpsv2"] = -reward_vals.mean() * float(getattr(self.hps_cfg, "reward_scale", 1.0))
 
             # Логирование только первых MAX_LOG_IMAGES изображений
             d["x0_s"] = self.interpolate_lpips(student_images[:MAX_LOG_IMAGES].detach()).to(
-                device="cpu", dtype=torch.float16
+                device="cpu", dtype=torch.float32
             )
             d["x0_t"] = self.interpolate_lpips(images[:MAX_LOG_IMAGES].detach()).to(
-                device="cpu", dtype=torch.float16
+                device="cpu", dtype=torch.float32
             )
             d["latents_s"] = student_latents[:MAX_LOG_IMAGES].detach().to(
-                device="cpu", dtype=torch.float16
+                device="cpu", dtype=torch.float32
             )
             # student_latents и student_images больше не нужны
             del student_latents, student_images
@@ -1175,10 +1187,10 @@ class GSWrapperLatent(GSWrapper):
             d['loss_l1_latents'] = torch.abs(latents - student_latents).mean((1, 2, 3))
             d['loss_l2_latents'] = torch.square(latents - student_latents).mean((1, 2, 3))
             d['x0_t'] = self.interpolate_lpips(images[:MAX_LOG_IMAGES].detach()).to(
-                device="cpu", dtype=torch.float16
+                device="cpu", dtype=torch.float32
             )
             d['latents_s'] = student_latents[:MAX_LOG_IMAGES].detach().to(
-                device="cpu", dtype=torch.float16
+                device="cpu", dtype=torch.float32
             )
 
         apply_repa = self.use_repa and self.repa_loss is not None and (

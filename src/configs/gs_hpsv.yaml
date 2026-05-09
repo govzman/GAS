@@ -1,0 +1,81 @@
+# gs_hps_reinforce.yaml — обучение Генерализованного Решателя (GS) через HPSv2 REINFORCE
+
+defaults:
+  - model: coco                   # модель Stable Diffusion на COCO
+  - scheduler_model: scheduler_transformer
+  - writer: cometml
+  - datasets: coco
+  - student_solver: sd_student_default  # характеристики солвера (steps, order и т.д.)
+  - teacher_solver: sd_teacher_default
+  - _self_
+
+# 🧠 Обучаемые параметры солвера (без теоретических коэффициентов — больше свободы)
+student_solver:
+  steps: 4
+  order: 3
+  use_theory_coef: true         # отключаем теоретические направляющие
+  t_eps: 0.001
+  guidance_scale: 3.0
+  # Параметризации для a, c и t_couple
+  a_parametrization: "diff"      # или "linear", "mlp" – зависит от ваших экспериментов
+  c_parametrization: "diff"
+  t_couple_parametrization: "diff"
+  t_parametrization: "diff"      # расписание t тоже обучается напрямую
+  # requires_grad уже заданы в конфиге солвера (по умолчанию True)
+  coef_prediction_mode: "all_at_once"   # не stepwise
+
+# 🎯 Лосс: HPSv2 с градиентом через REINFORCE
+loss_config:
+  loss_type: "HPSv2"
+  loss_key: loss_l1_latents     # не используется при HPSv2, но требуется для совместимости
+  disc_weight: 0.0              # без дискриминатора
+  disc_type: null
+  disc_lr: 0.0
+  hpsv2:
+    enabled: true
+    reward_scale: 1.0           # коэффициент масштабирования награды
+    grad_mode: "reinforce"      # ключевой параметр: backprop | reinforce
+    reinforce:
+      baseline: "batch_mean"    # уменьшение дисперсии
+      ema_beta: 0.9             # сглаживание бейзлайна (если потребуется)
+      entropy_weight: 0.01      # небольшой бонус за энтропию политики
+
+# 🧩 Стохастический параметрический предиктор для policy gradient
+solver_param_conditioning:
+  enabled: true
+  mode: "global_per_sample"      # предсказание одно на весь семпл (не per_step)
+  input: "latent_state"          # используем латентное состояние как контекст
+  feature_dim: 256
+  hidden_dim: 512
+  predict:
+    a_diff: true
+    c_diff: true
+    t_couple: true
+    timesteps: true             # шаги времени не трогаем — обучаем их отдельно
+  init:
+    output_zero: true            # нулевая инициализация остатков
+  clamp:
+    enabled: false               # без жёсткого клиппинга для стохастики
+  stochastic:
+    enabled: true                # обязательно для REINFORCE!
+    fixed_std: 0.05              # фиксированное стандартное отклонение
+    learn_std: false             # можно включить, если нужна обучаемая дисперсия
+
+# 🏋️ Оптимизаторы: отдельные для коэффициентов солвера и для предиктора (a_params)
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 1e-4                      # скорость обучения основных параметров GS
+
+optimizer_a_params:
+  _target_: torch.optim.AdamW
+  lr: 1e-4                      # скорость обучения предиктора (policy network)
+
+# 🚀 Параметры тренировки
+trainer:
+  n_iters: 5000
+  epoch_num: 2500
+  accumulation_steps: 2          # эффективный размер батча = 2 * data.batch_size
+  amp: "no"                     # fp16 или bf16 можно, но осторожно с HPS моделью
+  ema_decay: 0.999
+  device: "cuda"
+  seed: 42

@@ -129,7 +129,7 @@ def train(
                     with accelerator.autocast():
                         res_d = gs_wrapper.forward(batch=batch, return_timesteps=True)
                         loss = res_d["loss_total"].mean()
-
+                        
                     accelerator.backward(loss)
                     log_d = {"optim/time": time.time() - t_start}
 
