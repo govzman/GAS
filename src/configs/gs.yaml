@@ -3,7 +3,7 @@ defaults:
   - scheduler_model: scheduler_transformer
   - writer: cometml
   - datasets: coco
-  - student_solver: sd_student_stepwise_medium
+  - student_solver: sd_student_default
   - teacher_solver: sd_teacher_default
   - _self_
 

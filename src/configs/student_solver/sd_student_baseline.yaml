@@ -3,11 +3,11 @@ order: 3
 t_eps: 0.001
 latent_channels: 4
 text_embed_dim: 768
-t_couple_parametrization: diff   # diff | linear | mlp | film_mlp | prompt_noise_film_mlp | stepwise
+t_couple_parametrization: diff   # diff | film_mlp | prompt_noise_film_mlp
 
-t_parametrization: diff          # diff | linear | mlp | transformer | film_mlp | prompt_noise_film_mlp
-a_parametrization: diff # diff | linear | mlp | transformer | stepwise
-c_parametrization: diff # diff | linear | mlp | transformer | stepwise
+t_parametrization: diff          # diff | transformer | film_mlp | prompt_noise_film_mlp
+a_parametrization: diff          # diff | transformer | film_mlp | film_mlp_diff | diff_transformer
+c_parametrization: diff
 
 use_theory_coef: true
 guidance_scale: 7.5
