@@ -13,6 +13,7 @@ from src.model.gas.base_model import BaseModel
 from src.model.gas.generalized_solver import GeneralizedSolver
 from src.model.gas.adversarial_module.dist_adv_loss import DistAdversarialTraining
 from src.model.gas.synt_data import SyntDataType
+from src.model.gas.stepwise_coeff_predictor import StepwiseCoeffPredictor
 from src.scheduler_model.film_mlp import PromptNoiseFiLMMlp
 
 
@@ -131,6 +132,11 @@ class GSWrapper(nn.Module):
         if self.freeze_mlp_steps > 0:
             print(f"🧊 MLP will be DISABLED (not frozen) for first {self.freeze_mlp_steps} steps")
 
+        self.use_stepwise_coeff = bool(getattr(self.solver_config, "use_stepwise_coeff", False))
+        self.stepwise_predictor: Optional[StepwiseCoeffPredictor] = None
+        self._stepwise_coeff_buffers: Optional[Dict[str, torch.Tensor]] = None
+        self._stepwise_sampling_timesteps: Optional[torch.Tensor] = None
+
         # setup solver
         solver = self.get_base_solver()
         self.steps = self.solver_config.steps
@@ -162,6 +168,28 @@ class GSWrapper(nn.Module):
         # shared dimensions for conditional predictors
         self.latent_channels = int(getattr(self.solver_config, "latent_channels", 4))
         self.text_embed_dim = int(getattr(self.solver_config, "text_embed_dim", 768))
+
+        if self.use_stepwise_coeff:
+            stepwise_cfg = getattr(self.solver_config, "stepwise_predictor", None)
+            if stepwise_cfg is not None:
+                stepwise_cfg = dict(stepwise_cfg)
+                stepwise_cfg.setdefault("order", self.order)
+                stepwise_cfg.setdefault("latent_channels", self.latent_channels)
+                stepwise_cfg.setdefault("text_embed_dim", self.text_embed_dim)
+                self.stepwise_predictor = instantiate(stepwise_cfg)
+            else:
+                self.stepwise_predictor = StepwiseCoeffPredictor(
+                    order=self.order,
+                    latent_channels=self.latent_channels,
+                    text_embed_dim=self.text_embed_dim,
+                    hidden_dim=int(getattr(self.solver_config, "stepwise_hidden_dim", 256)),
+                )
+            print("🔁 Stepwise coefficient prediction enabled")
+            if self.use_shared_ac_backbone:
+                print(
+                    "⚠️ use_stepwise_coeff=True: shared_ac_backbone is not used during sampling; "
+                    "stepwise_predictor drives per-step coefficients."
+                )
         
         self.use_shared_ac_backbone = getattr(self.solver_config, "use_shared_ac_backbone", False)
         if self.use_shared_ac_backbone:
@@ -349,6 +377,11 @@ class GSWrapper(nn.Module):
             if self._c_bias is not None:
                 self._c_bias.requires_grad = self.solver_config.c_requires_grad
 
+        if self.stepwise_predictor is not None:
+            a_grad = bool(getattr(self.solver_config, "a_requires_grad", True))
+            c_grad = bool(getattr(self.solver_config, "c_requires_grad", True))
+            set_requires_grad(self.stepwise_predictor, a_grad or c_grad)
+
         # ---- t_couple parameters ----
         if self.t_couple_parametrization == "diff":
             pass
@@ -450,6 +483,96 @@ class GSWrapper(nn.Module):
             shuffled_cond_emb = cond_emb[cond_perm]
 
         return shuffled_x_t, shuffled_cond_emb
+
+    def _clear_stepwise_sampling_state(self) -> None:
+        self._stepwise_coeff_buffers = None
+        self._stepwise_sampling_timesteps = None
+
+    def _a_has_diff_baseline(self) -> bool:
+        return self.a_parametrization in ("diff", "film_mlp_diff", "diff_transformer")
+
+    def _c_has_diff_baseline(self) -> bool:
+        return self.c_parametrization in ("diff", "film_mlp_diff", "diff_transformer")
+
+    def _init_coeff_buffers(self, batch_size: int, device: torch.device, dtype: torch.dtype) -> None:
+        """Allocate (B, steps) coefficient tables for stepwise sampling."""
+        buffers: Dict[str, torch.Tensor] = {}
+        for i in range(1, self.order + 1):
+            a_name = f"a{i}_diff"
+            if self._a_has_diff_baseline():
+                base_a = getattr(self, a_name)
+                buffers[a_name] = base_a.unsqueeze(0).expand(batch_size, -1).clone().to(device=device, dtype=dtype)
+            else:
+                buffers[a_name] = torch.zeros(batch_size, self.steps, device=device, dtype=dtype)
+
+            c_name = f"c{i}_diff"
+            if self._c_has_diff_baseline():
+                base_c = getattr(self, c_name)
+                buffers[c_name] = base_c.unsqueeze(0).expand(batch_size, -1).clone().to(device=device, dtype=dtype)
+            else:
+                buffers[c_name] = torch.zeros(batch_size, self.steps, device=device, dtype=dtype)
+
+        self._stepwise_coeff_buffers = buffers
+        self._assign_stepwise_buffers_to_solver()
+
+    def _assign_stepwise_buffers_to_solver(self) -> None:
+        if self._stepwise_coeff_buffers is None:
+            return
+        for name, buf in self._stepwise_coeff_buffers.items():
+            self.solver.__setattr__(name, buf)
+
+    def _get_step_time(
+        self,
+        step_idx: int,
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        timesteps = self._stepwise_sampling_timesteps
+        if timesteps is None:
+            return torch.zeros(batch_size, device=device, dtype=dtype)
+        if timesteps.ndim == 2:
+            return timesteps[:, step_idx].to(device=device, dtype=dtype)
+        return timesteps[step_idx].expand(batch_size).to(device=device, dtype=dtype)
+
+    def _update_stepwise_coeffs(
+        self,
+        step_idx: int,
+        x_t: torch.Tensor,
+        cond_emb: Optional[torch.Tensor],
+    ) -> None:
+        """Predict and write coefficients for the current solver step into the buffer."""
+        if self._stepwise_coeff_buffers is None:
+            self._init_coeff_buffers(x_t.shape[0], x_t.device, x_t.dtype)
+
+        if self.mlp_disabled or self.stepwise_predictor is None:
+            return
+
+        shuffled_x, shuffled_cond = self._get_shuffled_inputs_for_coefficients(x_t, cond_emb)
+        if shuffled_cond is None:
+            return
+
+        t_current = self._get_step_time(step_idx, x_t.shape[0], x_t.device, x_t.dtype)
+        a_pred, c_pred = self.stepwise_predictor(shuffled_x, t_current, shuffled_cond)
+
+        for i in range(1, self.order + 1):
+            a_name = f"a{i}_diff"
+            c_name = f"c{i}_diff"
+            if self._a_has_diff_baseline():
+                self._stepwise_coeff_buffers[a_name][:, step_idx] = (
+                    getattr(self, a_name)[step_idx] + a_pred[:, i - 1]
+                )
+            else:
+                self._stepwise_coeff_buffers[a_name][:, step_idx] = a_pred[:, i - 1]
+
+            if self._c_has_diff_baseline():
+                self._stepwise_coeff_buffers[c_name][:, step_idx] = (
+                    getattr(self, c_name)[step_idx] + c_pred[:, i - 1]
+                )
+            else:
+                self._stepwise_coeff_buffers[c_name][:, step_idx] = c_pred[:, i - 1]
+
+        self._assign_stepwise_buffers_to_solver()
 
     def _update_dynamic_t_couple(
         self,
@@ -837,15 +960,28 @@ class GSWrapper(nn.Module):
         manual_solver_params = kwargs.pop("manual_solver_params", None)
             
         with self._manual_solver_params_context(manual_solver_params):
+            before_step_fn = None
             if manual_solver_params is None:
-                self._update_dynamic_t_couple(noise=noise, cond_emb=cond_emb)
-                self._update_dynamic_ac_coefs(noise=noise, cond_emb=cond_emb)
+                if self.use_stepwise_coeff:
+                    self._stepwise_sampling_timesteps = self.solver.get_time_steps(noise, cond_emb)
+                    self._stepwise_coeff_buffers = None
+                    self._update_dynamic_t_couple(noise=noise, cond_emb=cond_emb)
 
-            images = self.solver.sample(
-                x=noise,
-                steps=self.steps,
-                order=self.order,
-            )
+                    def before_step_fn(step_idx: int, x: torch.Tensor) -> None:
+                        self._update_stepwise_coeffs(step_idx, x, cond_emb)
+                else:
+                    self._update_dynamic_t_couple(noise=noise, cond_emb=cond_emb)
+                    self._update_dynamic_ac_coefs(noise=noise, cond_emb=cond_emb)
+
+            try:
+                images = self.solver.sample(
+                    x=noise,
+                    steps=self.steps,
+                    order=self.order,
+                    before_step_fn=before_step_fn,
+                )
+            finally:
+                self._clear_stepwise_sampling_state()
         return None, images
     
     # training function
@@ -951,15 +1087,28 @@ class GSWrapperLatent(GSWrapper):
         cond_emb = getattr(self.model.model_fn, "condition", None)
         
         with self._manual_solver_params_context(manual_solver_params):
+            before_step_fn = None
             if manual_solver_params is None:
-                self._update_dynamic_t_couple(noise=noise, cond_emb=cond_emb)
-                self._update_dynamic_ac_coefs(noise=noise, cond_emb=cond_emb)
+                if self.use_stepwise_coeff:
+                    self._stepwise_sampling_timesteps = self.solver.get_time_steps(noise, cond_emb)
+                    self._stepwise_coeff_buffers = None
+                    self._update_dynamic_t_couple(noise=noise, cond_emb=cond_emb)
 
-            latents = self.solver.sample(
-                x=noise,
-                steps=self.steps,
-                order=self.order,
-            )
+                    def before_step_fn(step_idx: int, x: torch.Tensor) -> None:
+                        self._update_stepwise_coeffs(step_idx, x, cond_emb)
+                else:
+                    self._update_dynamic_t_couple(noise=noise, cond_emb=cond_emb)
+                    self._update_dynamic_ac_coefs(noise=noise, cond_emb=cond_emb)
+
+            try:
+                latents = self.solver.sample(
+                    x=noise,
+                    steps=self.steps,
+                    order=self.order,
+                    before_step_fn=before_step_fn,
+                )
+            finally:
+                self._clear_stepwise_sampling_state()
 
         if decode:
             images = self.model.decode(latents)

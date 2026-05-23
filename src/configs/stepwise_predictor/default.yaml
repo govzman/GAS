@@ -1,0 +1,5 @@
+_target_: src.model.gas.stepwise_coeff_predictor.StepwiseCoeffPredictor
+hidden_dim: 256
+time_embed_dim: 64
+noise_feat_dim: 256
+noise_encoder_type: lightconv

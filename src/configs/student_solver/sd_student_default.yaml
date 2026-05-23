@@ -20,3 +20,10 @@ t_requires_grad: true
 t_couple_requires_grad: true
 a_requires_grad: true
 c_requires_grad: true
+
+# Stepwise coefficient prediction (per solver step, conditioned on x_t)
+use_stepwise_coeff: false
+# stepwise_predictor:
+#   _target_: src.model.gas.stepwise_coeff_predictor.StepwiseCoeffPredictor
+#   hidden_dim: 256
+#   noise_encoder_type: lightconv
