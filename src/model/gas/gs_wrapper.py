@@ -47,71 +47,6 @@ def _init_scheduler_transformer_residual_head(
             lin.bias.copy_(logistic_bias_1d.to(device=lin.bias.device, dtype=lin.bias.dtype))
     else:
         nn.init.zeros_(lin.bias)
-
-
-class PromptNoiseFiLMMlp(nn.Module):
-    """
-    Stable conditional MLP for coefficient tables that depends on both:
-    - prompt embedding (cond_emb): (B, T, 768)
-    - initial noise (noise): (B, C, H, W) or (B, ...)
-    Produces (B, out_dim) where out_dim = order * steps.
-    """
-
-    def __init__(self, out_dim: int, prompt_dim: int = 768, hidden_dim: int = 256, noise_feat_dim: int = 3):
-        super().__init__()
-        self.prompt_norm = nn.LayerNorm(prompt_dim)
-        self.noise_norm = nn.LayerNorm(noise_feat_dim)
-
-        self.prompt_mlp = nn.Sequential(
-            nn.Linear(prompt_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-        )
-        self.noise_mlp = nn.Sequential(
-            nn.Linear(noise_feat_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-        )
-
-        # FiLM params from noise branch: gamma,beta for prompt features
-        self.film = nn.Linear(hidden_dim, 2 * hidden_dim)
-        nn.init.zeros_(self.film.weight)
-        nn.init.zeros_(self.film.bias)
-
-        self.out_norm = nn.LayerNorm(hidden_dim)
-        self.head = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, out_dim),
-        )
-        # start from near-zero residuals (wrapper further scales residuals)
-        nn.init.zeros_(self.head[-1].weight)
-        nn.init.zeros_(self.head[-1].bias)
-
-    @staticmethod
-    def _noise_stats(noise: torch.Tensor) -> torch.Tensor:
-        # Robust low-dim summary of z0. Shape: (B, 3) = [mean, std, rms]
-        b = noise.shape[0]
-        flat = noise.reshape(b, -1)
-        mean = flat.mean(dim=1)
-        std = flat.std(dim=1, unbiased=False)
-        rms = (flat.pow(2).mean(dim=1) + 1e-12).sqrt()
-        return torch.stack([mean, std, rms], dim=1)
-
-    def forward(self, noise: torch.Tensor, cond_emb: torch.Tensor) -> torch.Tensor:
-        # cond_emb: (B, T, 768) -> pooled (B, 768)
-        p = cond_emb.mean(dim=1)
-        # p = self.prompt_norm(p)
-        hp = self.prompt_mlp(p)
-
-        n = self._noise_stats(noise).to(dtype=hp.dtype, device=hp.device)
-        # n = self.noise_norm(n)
-        hn = self.noise_mlp(n)
-
-        gamma, beta = self.film(hn).chunk(2, dim=1)
-        # h = self.out_norm(hp * (1.0 + gamma) + beta)
-        h = hp * (1.0 + gamma) + beta
-        return self.head(h)
     
 
 class GSWrapper(nn.Module):
@@ -189,6 +124,12 @@ class GSWrapper(nn.Module):
         assert self.loss_config.loss_type in ["GS", "GAS"]
         if self.loss_config.loss_type == "GAS":
             self.adv_loss = DistAdversarialTraining(self.loss_config)
+        
+        self.freeze_mlp_steps = int(getattr(self.solver_config, 'freeze_mlp_steps', 0))
+        self.mlp_disabled = (self.freeze_mlp_steps > 0)  # ⭐ Новый флаг вместо mlp_frozen
+
+        if self.freeze_mlp_steps > 0:
+            print(f"🧊 MLP will be DISABLED (not frozen) for first {self.freeze_mlp_steps} steps")
 
         # setup solver
         solver = self.get_base_solver()
@@ -239,6 +180,35 @@ class GSWrapper(nn.Module):
         # shared dimensions for conditional predictors
         self.latent_channels = int(getattr(self.solver_config, "latent_channels", 4))
         self.text_embed_dim = int(getattr(self.solver_config, "text_embed_dim", 768))
+        
+        self.use_shared_ac_backbone = getattr(self.solver_config, "use_shared_ac_backbone", False)
+        if self.use_shared_ac_backbone:
+            # 1. Создаём noise encoder из конфига
+            noise_enc_cfg = self.solver_config.noise_encoder
+            if noise_enc_cfg is None:
+                raise ValueError("use_shared_ac_backbone=True, но не задан noise_encoder")
+            # Передаём in_channels, если конфиг это поддерживает
+            noise_enc_cfg = dict(noise_enc_cfg)  # копия, чтобы не мутировать исходный
+            if 'in_channels' not in noise_enc_cfg:
+                noise_enc_cfg['in_channels'] = self.latent_channels
+            noise_encoder = instantiate(noise_enc_cfg)
+
+            # 2. Создаём сам ac backbone (SharedPromptNoiseFiLMBackbone с головами)
+            ac_backbone_cfg = self.solver_config.ac_backbone
+            if ac_backbone_cfg is None:
+                raise ValueError("use_shared_ac_backbone=True, но не задан ac_backbone")
+            ac_backbone_cfg = dict(ac_backbone_cfg)
+            # Передаём размерности выходов a и c (order*steps)
+            ac_backbone_cfg['a_out_dim'] = self.order * self.steps
+            ac_backbone_cfg['c_out_dim'] = self.order * self.steps
+            # Передаём уже созданный noise_encoder, чтобы не создавать второй раз
+            ac_backbone_cfg['noise_encoder'] = noise_encoder
+            # prompt_dim и др. можно не передавать, если они зафиксированы в конфиге
+            self.shared_ac_backbone = instantiate(ac_backbone_cfg)
+
+            # Старые модели больше не нужны
+            self.a_diff_model = None
+            self.c_diff_model = None
 
         # init t_couple
         self.t_couple_parametrization = getattr(self.solver_config, "t_couple_parametrization", "diff")
@@ -336,15 +306,33 @@ class GSWrapper(nn.Module):
                 nn.init.kaiming_uniform_(self.a_diff_model[3].weight, a=0.1)
                 nn.init.xavier_uniform_(self.a_diff_model[6].weight)  # или normal(0, 0.01)
                 nn.init.zeros_(self.a_diff_model[6].bias)
-            elif self.a_parametrization in ("film_mlp", "prompt_noise_film_mlp"):
-                # conditional on both prompt + initial noise statistics
+            # elif self.a_parametrization == "film_mlp":
+            #     # conditional on both prompt + initial noise statistics
+            #     hidden_dim = int(getattr(self.solver_config, "a_film_hidden_dim", 256))
+            #     self.a_diff_model = PromptNoiseFiLMMlp(out_dim=out_dim, hidden_dim=hidden_dim)
+            elif self.a_parametrization == "film_mlp_diff":
                 hidden_dim = int(getattr(self.solver_config, "a_film_hidden_dim", 256))
                 self.a_diff_model = PromptNoiseFiLMMlp(out_dim=out_dim, hidden_dim=hidden_dim)
+                self._a_bias = nn.Parameter(torch.zeros(self.order, self.steps),
+                                            requires_grad=self.solver_config.a_requires_grad)
             elif self.a_parametrization == "transformer":
                 a_cfg = getattr(config, "a_scheduler_model", None)
                 if a_cfg is None:
                     a_cfg = config.scheduler_model
                 self.a_diff_model = instantiate(a_cfg, num_timesteps=out_dim)
+            elif self.a_parametrization == "film_mlp":
+                a_cfg = getattr(config, "a_scheduler_model", None)
+                if a_cfg is None:
+                    a_cfg = config.scheduler_model
+                self.a_diff_model = instantiate(a_cfg)
+            elif self.a_parametrization == "diff_transformer":
+                # ⭐ Новая параметризация: diff + transformer residual
+                a_cfg = getattr(config, "a_scheduler_model", None)
+                if a_cfg is None:
+                    a_cfg = config.scheduler_model
+                self.a_diff_model = instantiate(a_cfg, num_timesteps=out_dim)
+                self._a_bias = nn.Parameter(torch.zeros(self.order, self.steps),
+                                            requires_grad=self.solver_config.a_requires_grad)
             elif self.a_parametrization == "stepwise":
                 self.a_diff_model = create_stepwise_predictor(
                     out_dim=self.order,
@@ -390,15 +378,33 @@ class GSWrapper(nn.Module):
                 nn.init.kaiming_uniform_(self.c_diff_model[3].weight, a=0.2)
                 nn.init.zeros_(self.c_diff_model[6].weight)
                 nn.init.zeros_(self.c_diff_model[6].bias)
-            elif self.c_parametrization in ("film_mlp", "prompt_noise_film_mlp"):
-                # conditional on both prompt + initial noise statistics
+            # elif self.c_parametrization in ("film_mlp", "prompt_noise_film_mlp"):
+            #     # conditional on both prompt + initial noise statistics
+            #     hidden_dim = int(getattr(self.solver_config, "c_film_hidden_dim", 256))
+            #     self.c_diff_model = PromptNoiseFiLMMlp(out_dim=out_dim, hidden_dim=hidden_dim)
+            elif self.c_parametrization == "film_mlp_diff":
                 hidden_dim = int(getattr(self.solver_config, "c_film_hidden_dim", 256))
                 self.c_diff_model = PromptNoiseFiLMMlp(out_dim=out_dim, hidden_dim=hidden_dim)
+                self._c_bias = nn.Parameter(torch.zeros(self.order, self.steps),
+                                            requires_grad=self.solver_config.c_requires_grad)
             elif self.c_parametrization == "transformer":
                 c_cfg = getattr(config, "c_scheduler_model", None)
                 if c_cfg is None:
                     c_cfg = config.scheduler_model
                 self.c_diff_model = instantiate(c_cfg, num_timesteps=out_dim)
+            elif self.c_parametrization == "film_mlp":
+                c_cfg = getattr(config, "c_scheduler_model", None)
+                if c_cfg is None:
+                    c_cfg = config.scheduler_model
+                self.c_diff_model = instantiate(c_cfg)
+            elif self.c_parametrization == "diff_transformer":
+                # ⭐ Новая параметризация: diff + transformer residual
+                c_cfg = getattr(config, "c_scheduler_model", None)
+                if c_cfg is None:
+                    c_cfg = config.scheduler_model
+                self.c_diff_model = instantiate(c_cfg, num_timesteps=out_dim)
+                self._c_bias = nn.Parameter(torch.zeros(self.order, self.steps),
+                                            requires_grad=self.solver_config.c_requires_grad)
             elif self.c_parametrization == "stepwise":
                 self.c_diff_model = create_stepwise_predictor(
                     out_dim=self.order,
@@ -425,7 +431,7 @@ class GSWrapper(nn.Module):
 
         # baseline coefficients (current behavior)
         # ====== A coefficients ======
-        if self.a_parametrization == "diff":
+        if self.a_parametrization in ("diff", "film_mlp_diff", "diff_transformer"):
             for i in range(1, self.order + 1):
                 aname = f'a{i}_diff'
                 self.register_parameter(
@@ -443,7 +449,7 @@ class GSWrapper(nn.Module):
 
 
         # ====== C coefficients ======
-        if self.c_parametrization == "diff":
+        if self.c_parametrization in ("diff", "film_mlp_diff", "diff_transformer"):
             for i in range(1, self.order + 1):
                 cname = f'c{i}_diff'
                 self.register_parameter(
@@ -478,7 +484,7 @@ class GSWrapper(nn.Module):
                 p.requires_grad = flag
 
         # ---- A parameters ----
-        if self.a_parametrization == "diff":
+        if self.a_parametrization in ("diff", "film_mlp_diff"):
             # diff params already created with requires_grad flag
             pass
         else:
@@ -489,7 +495,7 @@ class GSWrapper(nn.Module):
 
 
         # ---- C parameters ----
-        if self.c_parametrization == "diff":
+        if self.c_parametrization in ("diff", "film_mlp_diff"):
             pass
         else:
             set_requires_grad(self.c_diff_model, self.solver_config.c_requires_grad)
@@ -503,12 +509,10 @@ class GSWrapper(nn.Module):
             set_requires_grad(self.t_couple_model, self.solver_config.t_couple_requires_grad)
             if self._t_couple_bias is not None:
                 self._t_couple_bias.requires_grad = self.solver_config.t_couple_requires_grad
-        
+            
         # ==========================================
         # Residual initialization for conditional a/c
         # ==========================================
-
-        self.coeff_residual_scale = 0.01  # маленькая амплитуда
 
         def zero_last_layer(module):
             if _final_linear_scheduler_transformer(module) is not None:
@@ -527,11 +531,28 @@ class GSWrapper(nn.Module):
 
         # A model
         if self.a_diff_model is not None:
-            zero_last_layer(self.a_diff_model)
+            if self.a_parametrization == "diff_transformer":
+                # ⭐ Для transformer используем специальную инициализацию
+                if hasattr(config, "a_scheduler_model"):
+                    t_unif = torch.linspace(1.0, self.t_eps, self.steps + 1).flip(0)
+                    # Создаём фейковые логиты для transformer (он ожидает другой формат)
+                    # Трансформер будет предсказывать residual, начиная с нуля
+                    _init_scheduler_transformer_residual_head(self.a_diff_model)
+                else:
+                    zero_last_layer(self.a_diff_model)
+            else:
+                zero_last_layer(self.a_diff_model)
 
         # C model
         if self.c_diff_model is not None:
-            zero_last_layer(self.c_diff_model)
+            if self.c_parametrization == "diff_transformer":
+                # ⭐ Для transformer используем специальную инициализацию
+                if hasattr(config, "c_scheduler_model"):
+                    _init_scheduler_transformer_residual_head(self.c_diff_model)
+                else:
+                    zero_last_layer(self.c_diff_model)
+            else:
+                zero_last_layer(self.c_diff_model)
 
         # Расписание t: те же начальные логиты, что у linear/mlp (inv stick-breaking для равномерной сетки)
         if self.t_parametrization == "transformer":
@@ -541,7 +562,22 @@ class GSWrapper(nn.Module):
         
         # end init solver
         self.solver = solver
-    
+        
+    def disable_mlp(self):
+        """Отключает MLP-добавку (используются только базовые diff параметры)."""
+        self.mlp_disabled = True
+
+    def enable_mlp(self):
+        """Включает MLP-добавку."""
+        self.mlp_disabled = False
+
+    # Для обратной совместимости с training.py (если там вызывается freeze_mlp/unfreeze_mlp)
+    def freeze_mlp(self):
+        self.disable_mlp()
+
+    def unfreeze_mlp(self):
+        self.enable_mlp()
+        
     def _get_shuffled_inputs_for_coefficients(
         self, 
         x_t: torch.Tensor, 
@@ -620,7 +656,55 @@ class GSWrapper(nn.Module):
         If enabled by config, compute batch-dependent a/c coefficient tables and
         attach them to the solver as tensors of shape (B, steps).
         """
-        if self.a_parametrization != "diff":
+        # ---- SHARED BACKBONE ----
+        if self.use_shared_ac_backbone:
+            if self.mlp_disabled:
+                # Только базовые параметры (diff)
+                if self.a_parametrization in ("film_mlp_diff", "diff_transformer"):
+                    base_a = torch.stack([getattr(self, f'a{i}_diff') for i in range(1, self.order+1)], dim=0)
+                    a_all = base_a.unsqueeze(0).expand(noise.shape[0], -1, -1)
+                else:
+                    a_all = self._a_bias.unsqueeze(0).expand(noise.shape[0], -1, -1)
+                for i in range(1, self.order+1):
+                    self.solver.__setattr__(f"a{i}_diff", a_all[:, i-1, :])
+
+                if self.c_parametrization in ("film_mlp_diff", "diff_transformer"):
+                    base_c = torch.stack([getattr(self, f'c{i}_diff') for i in range(1, self.order+1)], dim=0)
+                    c_all = base_c.unsqueeze(0).expand(noise.shape[0], -1, -1)
+                else:
+                    c_all = self._c_bias.unsqueeze(0).expand(noise.shape[0], -1, -1)
+                for i in range(1, self.order+1):
+                    self.solver.__setattr__(f"c{i}_diff", c_all[:, i-1, :])
+                return
+
+            # Активный режим
+            if cond_emb is not None:
+                shuffled_noise, shuffled_cond_emb = self._get_shuffled_inputs_for_coefficients(noise, cond_emb)
+                a_flat, c_flat = self.shared_ac_backbone(shuffled_noise, shuffled_cond_emb)
+            else:
+                a_flat = self._a_bias.reshape(1, -1).expand(noise.shape[0], -1)
+                c_flat = self._c_bias.reshape(1, -1).expand(noise.shape[0], -1)
+
+            # Применяем a
+            if self.a_parametrization in ("film_mlp_diff", "diff_transformer"):
+                base_a = torch.stack([getattr(self, f'a{i}_diff') for i in range(1, self.order+1)], dim=0)
+                a_all = base_a.unsqueeze(0) + a_flat.reshape(-1, self.order, self.steps)
+            else:
+                a_all = a_flat.reshape(noise.shape[0], self.order, self.steps)
+            for i in range(1, self.order+1):
+                self.solver.__setattr__(f"a{i}_diff", a_all[:, i-1, :])
+
+            # Применяем c
+            if self.c_parametrization in ("film_mlp_diff", "diff_transformer"):
+                base_c = torch.stack([getattr(self, f'c{i}_diff') for i in range(1, self.order+1)], dim=0)
+                c_all = base_c.unsqueeze(0) + c_flat.reshape(-1, self.order, self.steps)
+            else:
+                c_all = c_flat.reshape(noise.shape[0], self.order, self.steps)
+            for i in range(1, self.order+1):
+                self.solver.__setattr__(f"c{i}_diff", c_all[:, i-1, :])
+            return
+        
+        if self.a_parametrization not in ("diff", "film_mlp_diff", "diff_transformer"):
             out_dim = self.order * self.steps
             if self.a_parametrization in ("linear", "mlp"):
                 shuffled_noise, shuffled_cond_emb = self._get_shuffled_inputs_for_coefficients(noise, cond_emb)
@@ -660,8 +744,48 @@ class GSWrapper(nn.Module):
             
             for i in range(1, self.order + 1):
                 self.solver.__setattr__(f"a{i}_diff", a_all[:, i - 1, :])
+        elif self.a_parametrization == "film_mlp_diff":
+            # ⭐ Режим diff + residual из MLP
+            base_a = torch.stack([getattr(self, f'a{i}_diff') for i in range(1, self.order+1)], dim=0)
 
-        if self.c_parametrization != "diff":
+            # ⭐ КЛЮЧЕВОЕ ИЗМЕНЕНИЕ: проверяем mlp_disabled вместо mlp_frozen
+            if not self.mlp_disabled:
+                # MLP включен: base + mlp_residual
+                if cond_emb is not None:
+                    mlp_out = self.a_diff_model(noise, cond_emb)
+                else:
+                    mlp_out = self._a_bias.reshape(1, -1).expand(noise.shape[0], -1)
+                mlp_out = mlp_out.reshape(-1, self.order, self.steps)
+                a_all = base_a.unsqueeze(0) + mlp_out
+            else:
+                # ⭐ MLP отключен: используем только base_a (diff параметры)
+                # Градиенты всё равно текут через весь граф!
+                a_all = base_a.unsqueeze(0).expand(noise.shape[0], -1, -1)
+
+            for i in range(1, self.order+1):
+                self.solver.__setattr__(f"a{i}_diff", a_all[:, i-1, :])
+        elif self.a_parametrization == "diff_transformer":
+            # ⭐ Режим diff + transformer residual
+            base_a = torch.stack([getattr(self, f'a{i}_diff') for i in range(1, self.order+1)], dim=0)
+
+            if not self.mlp_disabled:
+                # Transformer включен: base + transformer_residual
+                if cond_emb is not None:
+                    transformer_out = self.a_diff_model(noise, cond_emb)
+                else:
+                    dev = noise.device
+                    dummy_cond = torch.zeros(1, 77, 768, device=dev, dtype=noise.dtype)
+                    transformer_out = self.a_diff_model(noise, dummy_cond)
+                transformer_out = transformer_out.reshape(-1, self.order, self.steps)
+                a_all = base_a.unsqueeze(0) + transformer_out
+            else:
+                # ⭐ Transformer отключен: используем только base_a (diff параметры)
+                a_all = base_a.unsqueeze(0).expand(noise.shape[0], -1, -1)
+
+            for i in range(1, self.order+1):
+                self.solver.__setattr__(f"a{i}_diff", a_all[:, i-1, :])
+        
+        if self.c_parametrization not in ("diff", "film_mlp_diff", "diff_transformer"):
             out_dim = self.order * self.steps
             if self.c_parametrization in ("linear", "mlp"):
                 shuffled_noise, shuffled_cond_emb = self._get_shuffled_inputs_for_coefficients(noise, cond_emb)
@@ -701,7 +825,47 @@ class GSWrapper(nn.Module):
             
             for i in range(1, self.order + 1):
                 self.solver.__setattr__(f"c{i}_diff", c_all[:, i - 1, :])
-            
+        elif self.c_parametrization == "film_mlp_diff":  # ⭐ ИСПРАВЛЕНО: было a_parametrization
+            # ⭐ Режим diff + residual из MLP
+            base_c = torch.stack([getattr(self, f'c{i}_diff') for i in range(1, self.order+1)], dim=0)
+
+            # ⭐ КЛЮЧЕВОЕ ИЗМЕНЕНИЕ: проверяем mlp_disabled вместо mlp_frozen
+            if not self.mlp_disabled:
+                # MLP включен: base + mlp_residual
+                if cond_emb is not None:
+                    mlp_out = self.c_diff_model(noise, cond_emb)
+                else:
+                    mlp_out = self._c_bias.reshape(1, -1).expand(noise.shape[0], -1)
+                mlp_out = mlp_out.reshape(-1, self.order, self.steps)
+                c_all = base_c.unsqueeze(0) + mlp_out
+            else:
+                # ⭐ MLP отключен: используем только base_c (diff параметры)
+                # Градиенты всё равно текут через весь граф!
+                c_all = base_c.unsqueeze(0).expand(noise.shape[0], -1, -1)
+
+            for i in range(1, self.order+1):
+                self.solver.__setattr__(f"c{i}_diff", c_all[:, i-1, :])
+        elif self.c_parametrization == "diff_transformer":
+            # ⭐ Режим diff + transformer residual
+            base_c = torch.stack([getattr(self, f'c{i}_diff') for i in range(1, self.order+1)], dim=0)
+
+            if not self.mlp_disabled:
+                # Transformer включен: base + transformer_residual
+                if cond_emb is not None:
+                    transformer_out = self.c_diff_model(noise, cond_emb)
+                else:
+                    dev = noise.device
+                    dummy_cond = torch.zeros(1, 77, 768, device=dev, dtype=noise.dtype)
+                    transformer_out = self.c_diff_model(noise, dummy_cond)
+                transformer_out = transformer_out.reshape(-1, self.order, self.steps)
+                c_all = base_c.unsqueeze(0) + transformer_out
+            else:
+                # ⭐ Transformer отключен: используем только base_c (diff параметры)
+                c_all = base_c.unsqueeze(0).expand(noise.shape[0], -1, -1)
+
+            for i in range(1, self.order+1):
+                self.solver.__setattr__(f"c{i}_diff", c_all[:, i-1, :])
+
     # timesteps logic
     def get_t_steps(self, noise=None, cond_emb=None, **kwargs) -> torch.Tensor:
         """Get generation timesteps."""

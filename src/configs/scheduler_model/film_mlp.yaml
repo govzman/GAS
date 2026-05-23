@@ -1,0 +1,7 @@
+_target_: src.scheduler_model.PromptNoiseFiLMMlp
+out_dim: 256
+prompt_dim: 768
+hidden_dim: 256
+noise_feat_dim: 3
+noise_encoder_type: "lightconv"      # stats, lightconv, pyramid, patch
+in_channels: 3

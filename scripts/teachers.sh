@@ -43,17 +43,11 @@ NFEs=(5)
 for NFE in "${NFEs[@]}"
 do
 echo "Generate SD nfe=${NFE}"
-torchrun --standalone --nproc_per_node=1 generate.py \
-    outdir="'data/teachers/sd-v1/nfe=${NFE}'" \
-    seeds="00000-01449" \
-    max_batch_size=4 \
-    create_dataset=True \
-    teacher_solver.steps=${NFE} \
-    teacher_solver.order=$((NFE-1))
+torchrun --standalone --nproc_per_node=1 generate.py 
 
 echo "Collate SD nfe=${NFE}"
 python collate.py \
-    --synt_dir=data/teachers/sd-v1/nfe=${NFE}/dataset \
-    --out_pkl=data/teachers/sd-v1/nfe=${NFE}/dataset.pkl \
-	--num_samples=1450
+    --synt_dir=data/teachers/sd-v1/synt6/dataset \
+    --out_pkl=data/teachers/sd-v1/synt6/dataset.pkl \
+	--num_samples=100
 done

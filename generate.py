@@ -80,6 +80,7 @@ def sample_manual_gs_params(
     batch_size: int,
     device: torch.device,
     cfg: DictConfig,
+    seed: int,
 ) -> Dict[str, torch.Tensor]:
     coef_std = float(getattr(cfg, "coef_std", 0.01))
     t_couple_std = float(getattr(cfg, "t_couple_std", coef_std))
@@ -90,7 +91,8 @@ def sample_manual_gs_params(
     steps = int(gs_wrapper.steps)
     order = int(gs_wrapper.order)
     params = {}
-
+    
+    torch.manual_seed(seed)
     for i in range(1, order + 1):
         params[f"a{i}_diff"] = torch.randn(batch_size, steps, device=device) * coef_std
         params[f"c{i}_diff"] = torch.randn(batch_size, steps, device=device) * coef_std
@@ -103,7 +105,11 @@ def sample_manual_gs_params(
         base_logits = gs_wrapper.get_inv_t_steps(base_t).reshape(1, -1).repeat(batch_size, 1)
         logits = base_logits + torch.randn_like(base_logits) * t_std
         params["timesteps"] = gs_wrapper.get_mu_t_steps(logits).flip(1)
-
+    else:
+        base_t = torch.linspace(1.0, gs_wrapper.t_eps, steps + 1, device=device).flip(0)
+        logits = gs_wrapper.get_inv_t_steps(base_t).reshape(1, -1).repeat(batch_size, 1)
+        params["timesteps"] = gs_wrapper.get_mu_t_steps(logits).flip(1)
+        # params["timesteps"] = torch.linspace(1., gs_wrapper.t_eps, steps + 1, device=device).repeat(batch_size, 1) # torch.tensor([[1.0000, 0.7502, 0.5005, 0.2508, 0.0010]], device=device)
     return params
 
 
@@ -152,7 +158,8 @@ def main(config: DictConfig):
     if use_synthetic_gs:
         synthetic_count = int(getattr(synthetic_cfg, "count", 100))
         fixed_noise_seed = int(getattr(synthetic_cfg, "fixed_noise_seed", 0))
-        seeds = list(range(synthetic_count))
+        # seeds = list(range(synthetic_count))
+        seeds = [i // 2 for i in range(synthetic_count)]
         num_batches = (
             (len(seeds) - 1) // (max_batch_size * dist.get_world_size()) + 1
         ) * dist.get_world_size()
@@ -240,8 +247,8 @@ def main(config: DictConfig):
 
     # Loop over batches.
     dist.print0(f'Generating {len(seeds)} images to "{outdir}"...')
-    for batch_seeds in tqdm.tqdm(
-        rank_batches, unit="batch", disable=(dist.get_rank() != 0)
+    for j, batch_seeds in tqdm.tqdm(
+        enumerate(rank_batches), unit="batch", disable=(dist.get_rank() != 0)
     ):
         torch.distributed.barrier()
 
@@ -252,16 +259,17 @@ def main(config: DictConfig):
         shape[0] = batch_size
 
         # Pick latents and labels.
-        if use_synthetic_gs:
-            noise = fixed_noise.repeat(batch_size, 1, 1, 1)
-        else:
-            rnd = StackedRandomGenerator(device, batch_seeds)
-            noise = rnd.randn(shape, device=device)
+        # if use_synthetic_gs:
+        #     noise = fixed_noise.repeat(batch_size, 1, 1, 1)
+        # else:
+        rnd = StackedRandomGenerator(device, batch_seeds)
+        noise = rnd.randn(shape, device=device)
+        # print(batch_seeds, noise.mean())
 
         condition = None
         if model_config.conditional:
             if use_synthetic_gs:
-                condition = [prompts_override[int(i)] for i in batch_seeds.tolist()]
+                condition = [prompts_override[j % 2]]
             else:
                 condition = model.iterate_condition(batch_seeds.tolist())
 
@@ -274,6 +282,7 @@ def main(config: DictConfig):
                     batch_size=batch_size,
                     device=device,
                     cfg=synthetic_cfg,
+                    seed=0
                 )
             latents, images = sampler_fn(
                 noise=noise,
@@ -303,7 +312,7 @@ def main(config: DictConfig):
                     for k, v in (manual_solver_params or {}).items()
                 },
             }
-            torch.save(dataset, os.path.join(synt_dir, f"{batch_seeds[0]}.pt"))
+            torch.save(dataset, os.path.join(synt_dir, f"{j}.pt"))
 
         # Save images.
         if model_config.type == "EDM":
@@ -321,7 +330,8 @@ def main(config: DictConfig):
             images_np = custom_to_np(images)
 
         for seed, image_np in zip(batch_seeds, images_np):
-            image_path = os.path.join(outdir, f"{seed:06d}.png")
+            image_path = os.path.join(outdir, f"{j:06d}.png")
+            # print(f"{j:06d}.png", noise.mean(), 
             PIL.Image.fromarray(image_np, "RGB").save(image_path)
 
     # Done.

@@ -1,0 +1,129 @@
+defaults:
+  - model: coco
+  - scheduler_model: film_mlp
+  - writer: cometml
+  - datasets: coco
+  - student_solver: sd_student_baseline
+  - teacher_solver: sd_teacher_default
+  - _self_
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 0.001
+
+# lr_scheduler:
+#   _target_: torch.optim.lr_scheduler.CosineAnnealingLR
+#   T_max: ${trainer.n_iters}
+#   eta_min: 0.0
+
+optimizer_a_params:
+  _target_: torch.optim.AdamW
+  lr: 3.0e-4
+
+# lr_scheduler_a_params:
+#   _target_: torch.optim.lr_scheduler.CosineAnnealingLR
+#   T_max: ${trainer.n_iters}
+#   eta_min: 0.0
+
+loss_config:
+  loss_type: "GS"
+  loss_key: loss_l1_latents
+  disc_weight: 1
+  disc_type: latent_4
+  disc_lr: 1.0e-5
+
+trainer:
+  n_iters: 5000
+  epoch_num: 15
+  iters_to_accumulate: 1
+  accumulation_steps: 1
+  amp: "no"
+  ema_decay: 0.999
+  device: "cuda"
+  seed: 42
+  checkpoints_dir: "./checkpoints/04_28_04_14_29"
+  print_gt_solver_every: 100
+
+# Дополнительные поля из JSON, не входившие в исходный gs.yaml
+cn: "gs.yaml"
+curr_step: "2662"
+
+datasets:
+  batch_size: 4
+  dataset_shift: 0
+  num_workers: 1
+  size_vis: 4
+  teacher_pkl: "data/teachers/sd-v1/nfe=5/dataset.pkl"
+  train_size: 1400
+  use_condition: true
+  use_latents: true
+  validation_batch_size: 4
+  validation_size: 50
+
+model:
+  conditional: true
+  guidance_scale: 7.5
+  path: "src/configs/model/v1-inference.yaml"
+  prompts_path: "data/coco_captions.txt"
+  t_eps: 0.001
+  type: "SD"
+
+student_solver:
+  a_parametrization: "film_mlp"
+  a_requires_grad: true
+  c_parametrization: "film_mlp"
+  c_requires_grad: true
+  guidance_scale: 7.5
+  order: 3
+  steps: 4
+  t_couple_requires_grad: true
+  t_eps: 0.001
+  t_parametrization: "mu_logit"
+  t_requires_grad: true
+  use_theory_coef: true
+  freeze_mlp_steps: 0
+  use_shared_ac_backbone: true
+
+  noise_encoder:
+    _target_:  src.scheduler_model.film_mlp.noise_encoders.noise_encoders.LightConvNoiseEncoder
+    feat_dim: 256
+    in_channels: 4 # latent_channels
+    base_width: 32
+
+  ac_backbone:
+    _target_: src.scheduler_model.film_mlp_shared.SharedPromptNoiseFiLMBackbone
+    prompt_dim: 768
+    hidden_dim: 256
+    latent_dim: 256
+    head_hidden_dim: 128
+    noise_encoder: null
+
+teacher_solver:
+  guidance_scale: 7.5
+  order: 3
+  steps: 5
+  t_eps: 0.001
+
+writer:
+  checkpoint_freq: 1000
+  eval_freq: 10
+  log_weights_freq: 10
+  mode: "online"
+  project_name: "test_GAS"
+  run_name: "film_mlp 1400 images"
+  workspace: "govzman"
+
+noise_encoder:
+    _target_:  src.scheduler_model.film_mlp.noise_encoders.noise_encoders.LightConvNoiseEncoder
+    feat_dim: 256
+    in_channels: 4 # latent_channels
+    base_width: 32
+
+# Shared backbone для A и C
+ac_backbone:
+    _target_: src.scheduler_model.film_mlp_shared.SharedPromptNoiseFiLMBackbone
+    prompt_dim: 768
+    hidden_dim: 256
+    latent_dim: 256
+    head_hidden_dim: 128
+    noise_encoder: null

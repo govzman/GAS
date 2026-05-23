@@ -42,6 +42,10 @@ def train(
         gs_wrapper, data.train_loader, data.test_loader = accelerator.prepare(
             gs_wrapper, data.train_loader, data.test_loader
         )
+        
+    freeze_steps = getattr(config.student_solver, 'freeze_mlp_steps', 0)
+    if freeze_steps > 0 and is_main:
+        print(f"🧊 MLP will be DISABLED for first {freeze_steps} steps (masking, not freezing)")
 
     lr_scheduler = None
     lr_scheduler_a_params = None
@@ -86,6 +90,49 @@ def train(
             if global_step == config.trainer.n_iters:
                 break
             global_step += 1
+            # ⭐ КЛЮЧЕВОЕ ИЗМЕНЕНИЕ: просто переключаем флаг
+            if freeze_steps > 0 and global_step == freeze_steps:
+                gs_wrapper.mlp_disabled = False
+                if is_main:
+                    print(f"🔓 MLP ENABLED at step {global_step}")
+            
+            # ⭐ ДИАГНОСТИКА после включения MLP
+            if freeze_steps > 0 and global_step == freeze_steps + 1 and is_main:
+                print("\n🔍 DIAGNOSTIC: Checking MLP after enabling")
+
+                # Проверка a_diff_model
+                if hasattr(gs_wrapper, 'a_diff_model') and gs_wrapper.a_diff_model is not None:
+                    print("=== a_diff_model ===")
+                    for name, param in gs_wrapper.a_diff_model.named_parameters():
+                        if param.grad is not None:
+                            print(f"  {name}: grad_norm={param.grad.norm().item():.6f}, "
+                                  f"param_norm={param.norm().item():.6f}, "
+                                  f"requires_grad={param.requires_grad}")
+                        else:
+                            print(f"  {name}: grad=None, requires_grad={param.requires_grad}")
+
+                # Проверка c_diff_model
+                if hasattr(gs_wrapper, 'c_diff_model') and gs_wrapper.c_diff_model is not None:
+                    print("=== c_diff_model ===")
+                    for name, param in gs_wrapper.c_diff_model.named_parameters():
+                        if param.grad is not None:
+                            print(f"  {name}: grad_norm={param.grad.norm().item():.6f}, "
+                                  f"param_norm={param.norm().item():.6f}, "
+                                  f"requires_grad={param.requires_grad}")
+                        else:
+                            print(f"  {name}: grad=None, requires_grad={param.requires_grad}")
+
+                # Проверка базовых diff параметров
+                print("=== base diff params ===")
+                for i in range(1, gs_wrapper.order + 1):
+                    for prefix in ['a', 'c']:
+                        pname = f'{prefix}{i}_diff'
+                        if hasattr(gs_wrapper, pname):
+                            param = getattr(gs_wrapper, pname)
+                            if param.grad is not None:
+                                print(f"  {pname}: grad_norm={param.grad.norm().item():.6f}, "
+                                      f"param_norm={param.norm().item():.6f}")
+                print()
 
             t_start = time.time()
 

@@ -1,1 +1,3 @@
 from src.scheduler_model.scheduler_transformer import SchedulerTransformer
+from src.scheduler_model.film_mlp import PromptNoiseFiLMMlp
+from src.scheduler_model.film_mlp_shared import SharedPromptNoiseFiLMBackbone

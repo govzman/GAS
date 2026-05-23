@@ -1,7 +1,7 @@
-teacher_pkl: "data/teachers/sd-v1/nfe=6/dataset.pkl"
+teacher_pkl: "data/teachers/sd-v1/synt4/dataset.pkl"
 use_latents: true
 use_condition: true
-train_size: 4
+train_size: 96
 batch_size: 2
 dataset_shift: 0
 validation_batch_size: 2

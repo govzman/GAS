@@ -14,23 +14,21 @@ loss_config:
   disc_lr: 0.00001
 
 # model: src/model/coco
-outdir: "data/teachers/sd-v1/nfe=5"
-seeds: "00000-01449"
-max_batch_size: 4
+outdir: "data/teachers/sd-v1/synt6"
+seeds: "00000-00099"
+max_batch_size: 1
 checkpoint_path: null
 create_dataset: true
 device: cuda
 
 synthetic_gs_dataset:
-  enabled: false
+  enabled: true
   count: 100
-  fixed_noise_seed: 12345
-  prompt_seed: 12345
-  nfe: 4
+  nfe: 5
   order: 3
   coef_std: 0.01
   t_couple_std: 0.01
   include_t_couple: true
-  include_timesteps: true
+  include_timesteps: false
   t_std: 0.005
   prompts: null
