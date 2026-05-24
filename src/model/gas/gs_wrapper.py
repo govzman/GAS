@@ -169,6 +169,7 @@ class GSWrapper(nn.Module):
         self.latent_channels = int(getattr(self.solver_config, "latent_channels", 4))
         self.text_embed_dim = int(getattr(self.solver_config, "text_embed_dim", 768))
 
+        self.use_shared_ac_backbone = getattr(self.solver_config, "use_shared_ac_backbone", False)
         if self.use_stepwise_coeff:
             stepwise_cfg = getattr(self.solver_config, "stepwise_predictor", None)
             if stepwise_cfg is not None:
@@ -191,7 +192,6 @@ class GSWrapper(nn.Module):
                     "stepwise_predictor drives per-step coefficients."
                 )
         
-        self.use_shared_ac_backbone = getattr(self.solver_config, "use_shared_ac_backbone", False)
         if self.use_shared_ac_backbone:
             # 1. Создаём noise encoder из конфига
             noise_enc_cfg = self.solver_config.noise_encoder
@@ -541,37 +541,40 @@ class GSWrapper(nn.Module):
         x_t: torch.Tensor,
         cond_emb: Optional[torch.Tensor],
     ) -> None:
-        """Predict and write coefficients for the current solver step into the buffer."""
-        if self._stepwise_coeff_buffers is None:
-            self._init_coeff_buffers(x_t.shape[0], x_t.device, x_t.dtype)
+        """Predict and attach coefficients for the current solver step (no in-place buffer writes)."""
+        batch_size = x_t.shape[0]
+        device, dtype = x_t.device, x_t.dtype
 
         if self.mlp_disabled or self.stepwise_predictor is None:
+            if self._stepwise_coeff_buffers is None:
+                self._init_coeff_buffers(batch_size, device, dtype)
             return
 
         shuffled_x, shuffled_cond = self._get_shuffled_inputs_for_coefficients(x_t, cond_emb)
         if shuffled_cond is None:
             return
 
-        t_current = self._get_step_time(step_idx, x_t.shape[0], x_t.device, x_t.dtype)
+        t_current = self._get_step_time(step_idx, batch_size, device, dtype)
         a_pred, c_pred = self.stepwise_predictor(shuffled_x, t_current, shuffled_cond)
 
+        # Rebuild (B, steps) tables each call. _get_step_param reads column params_step;
+        # broadcasting the current-step value avoids in-place mutation that breaks backward.
+        buffers: Dict[str, torch.Tensor] = {}
         for i in range(1, self.order + 1):
             a_name = f"a{i}_diff"
             c_name = f"c{i}_diff"
             if self._a_has_diff_baseline():
-                self._stepwise_coeff_buffers[a_name][:, step_idx] = (
-                    getattr(self, a_name)[step_idx] + a_pred[:, i - 1]
-                )
+                a_val = getattr(self, a_name)[step_idx] + a_pred[:, i - 1]
             else:
-                self._stepwise_coeff_buffers[a_name][:, step_idx] = a_pred[:, i - 1]
-
+                a_val = a_pred[:, i - 1]
             if self._c_has_diff_baseline():
-                self._stepwise_coeff_buffers[c_name][:, step_idx] = (
-                    getattr(self, c_name)[step_idx] + c_pred[:, i - 1]
-                )
+                c_val = getattr(self, c_name)[step_idx] + c_pred[:, i - 1]
             else:
-                self._stepwise_coeff_buffers[c_name][:, step_idx] = c_pred[:, i - 1]
+                c_val = c_pred[:, i - 1]
+            buffers[a_name] = a_val.unsqueeze(1).expand(batch_size, self.steps)
+            buffers[c_name] = c_val.unsqueeze(1).expand(batch_size, self.steps)
 
+        self._stepwise_coeff_buffers = buffers
         self._assign_stepwise_buffers_to_solver()
 
     def _update_dynamic_t_couple(
