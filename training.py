@@ -12,7 +12,14 @@ from omegaconf import OmegaConf
 from evaluate import NOT_LOG_KEYS, evaluate_wrapper
 from src.model.gas.gs_wrapper import GSWrapper
 from src.model.gas.synt_data import SyntDataset, move_batch_to_device
-from src.model.gas.utils.loggers import log_end_img, log_grads, log_t_steps, log_weights
+from src.model.gas.utils.loggers import (
+    log_end_img,
+    log_final_solver_coeffs,
+    log_grads,
+    log_t_steps,
+    log_weights,
+    print_final_solver_coeffs,
+)
 from typing import Optional
 
 
@@ -138,6 +145,13 @@ def train(
 
             batch = move_batch_to_device(batch, device)
 
+            log_solver_coeffs = (
+                is_main
+                and gs_wrapper.should_log_final_solver_coeffs()
+                and global_step % config.writer.log_weights_freq == 0
+            )
+            gs_wrapper.set_retain_solver_coeff_grads(log_solver_coeffs)
+
             if accelerator is None:
                 res_d = gs_wrapper.forward(batch=batch, return_timesteps=True)
                 loss = res_d["loss_total"].mean() / config.trainer.iters_to_accumulate
@@ -146,7 +160,17 @@ def train(
 
                 if global_step % config.trainer.iters_to_accumulate == 0:
                     if exp is not None and global_step % config.writer.log_weights_freq == 0:
-                        log_grads(exp=exp, model=gs_wrapper, global_step=global_step)
+                        solver_grads = (
+                            gs_wrapper.get_final_solver_coeff_grads_for_logging()
+                            if log_solver_coeffs
+                            else None
+                        )
+                        log_grads(
+                            exp=exp,
+                            model=gs_wrapper,
+                            global_step=global_step,
+                            solver_grads=solver_grads,
+                        )
 
                     grad_norm = torch.nn.utils.clip_grad_norm_(gs_wrapper.parameters(), 1.0)
                     
@@ -165,6 +189,11 @@ def train(
                     if exp is not None and global_step % config.writer.log_weights_freq == 0:
                         log_t_steps(exp, res_d["timesteps"], global_step=global_step)
                         log_weights(exp, model=gs_wrapper, global_step=global_step)
+                        if log_solver_coeffs:
+                            final_coeffs = gs_wrapper.get_final_solver_coeffs_for_logging()
+                            log_final_solver_coeffs(
+                                exp, final_coeffs, global_step=global_step
+                            )
 
                     log_d["optim/grad_norm"] = grad_norm
                     if optim:
@@ -182,7 +211,17 @@ def train(
 
                     if accelerator.sync_gradients:
                         if exp is not None and global_step % config.writer.log_weights_freq == 0:
-                            log_grads(exp=exp, model=gs_wrapper, global_step=global_step)
+                            solver_grads = (
+                                gs_wrapper.get_final_solver_coeff_grads_for_logging()
+                                if log_solver_coeffs
+                                else None
+                            )
+                            log_grads(
+                                exp=exp,
+                                model=gs_wrapper,
+                                global_step=global_step,
+                                solver_grads=solver_grads,
+                            )
 
                         grad_norm = accelerator.clip_grad_norm_(gs_wrapper.parameters(), 1.0)
 
@@ -201,6 +240,11 @@ def train(
                         if exp is not None and global_step % config.writer.log_weights_freq == 0:
                             log_t_steps(exp, res_d["timesteps"], global_step=global_step)
                             log_weights(exp, model=gs_wrapper, global_step=global_step)
+                            if log_solver_coeffs:
+                                final_coeffs = gs_wrapper.get_final_solver_coeffs_for_logging()
+                                log_final_solver_coeffs(
+                                    exp, final_coeffs, global_step=global_step
+                                )
 
                         log_d["optim/grad_norm"] = float(grad_norm)
                         if optim:
@@ -211,6 +255,13 @@ def train(
             for k, v in res_d.items():
                 if k not in NOT_LOG_KEYS:
                     log_d[f"train/{k}"] = v.mean().item()
+
+            if log_solver_coeffs:
+                final_coeffs = gs_wrapper.get_final_solver_coeffs_for_logging()
+                print_final_solver_coeffs(
+                    final_coeffs,
+                    header=f"[train step {global_step}]",
+                )
 
             print_every = int(getattr(config.trainer, "print_gt_solver_every", 0))
             if is_main and print_every > 0 and global_step % print_every == 0:
@@ -261,6 +312,16 @@ def train(
                         global_step=global_step,
                     )
                     log_weights(exp=exp, model=gs_wrapper, global_step=global_step, suff="_ema")
+                    if gs_wrapper.should_log_final_solver_coeffs():
+                        final_coeffs_ema = gs_wrapper.get_final_solver_coeffs_for_logging()
+                        log_final_solver_coeffs(
+                            exp,
+                            final_coeffs_ema,
+                            global_step=global_step,
+                            suff="_ema",
+                        )
+
+            gs_wrapper.set_retain_solver_coeff_grads(False)
 
             if is_main and (global_step % config.writer.checkpoint_freq == 0 or global_step == 1):
                 model_to_save = gs_wrapper

@@ -1,6 +1,7 @@
 import contextlib
 import lpips
 
+import numpy as np
 import torch
 from torch import nn
 from typing import Tuple, Optional, Any, List, Dict
@@ -136,6 +137,8 @@ class GSWrapper(nn.Module):
         self.stepwise_predictor: Optional[StepwiseCoeffPredictor] = None
         self._stepwise_coeff_buffers: Optional[Dict[str, torch.Tensor]] = None
         self._stepwise_sampling_timesteps: Optional[torch.Tensor] = None
+        self._stepwise_vis_trace: Optional[Dict[str, List[float]]] = None
+        self._retain_solver_coeff_grads: bool = False
 
         # setup solver
         solver = self.get_base_solver()
@@ -488,6 +491,108 @@ class GSWrapper(nn.Module):
         self._stepwise_coeff_buffers = None
         self._stepwise_sampling_timesteps = None
 
+    def should_log_final_solver_coeffs(self) -> bool:
+        """True when effective coeffs live on the solver (not only static diff Parameters)."""
+        if self.use_stepwise_coeff:
+            return True
+        if self.a_parametrization != "diff" or self.c_parametrization != "diff":
+            return True
+        if self.t_couple_parametrization != "diff":
+            return True
+        return False
+
+    def set_retain_solver_coeff_grads(self, enabled: bool) -> None:
+        self._retain_solver_coeff_grads = bool(enabled)
+
+    def enable_stepwise_vis_trace(self, enabled: bool) -> None:
+        self._stepwise_vis_trace = {} if enabled else None
+
+    def consume_stepwise_vis_trace(self) -> Optional[Dict[str, List[float]]]:
+        trace = self._stepwise_vis_trace
+        self._stepwise_vis_trace = None
+        return trace
+
+    def _retain_solver_coeff_if_needed(self, tensor: torch.Tensor) -> torch.Tensor:
+        if self._retain_solver_coeff_grads and tensor.requires_grad:
+            tensor.retain_grad()
+        return tensor
+
+    def _attach_solver_coeff(self, name: str, tensor: torch.Tensor) -> None:
+        self.solver.__setattr__(name, self._retain_solver_coeff_if_needed(tensor))
+
+    def get_final_solver_coeff_tensors(self) -> Dict[str, torch.Tensor]:
+        """Coefficients currently on the solver after sampling (may be batch-dependent)."""
+        out: Dict[str, torch.Tensor] = {}
+        for i in range(1, self.order + 1):
+            for prefix in ("a", "c"):
+                name = f"{prefix}{i}_diff"
+                t = getattr(self.solver, name, None)
+                if isinstance(t, torch.Tensor):
+                    out[name] = t
+        t_couple = getattr(self.solver, "t_couple", None)
+        if isinstance(t_couple, torch.Tensor):
+            out["t_couple"] = t_couple
+        return out
+
+    @staticmethod
+    def _reduce_coeff_tensor_for_logging(
+        tensor: torch.Tensor,
+        reduction: str = "mean",
+    ) -> np.ndarray:
+        t = tensor.detach().float()
+        if t.ndim == 0:
+            return t.cpu().numpy().reshape(1)
+        if t.ndim == 1:
+            return t.cpu().numpy()
+        if reduction == "batch0":
+            return t[0].cpu().numpy()
+        return t.mean(dim=0).cpu().numpy()
+
+    def get_final_solver_coeffs_for_logging(
+        self,
+        reduction: str = "mean",
+    ) -> Dict[str, np.ndarray]:
+        return {
+            name: self._reduce_coeff_tensor_for_logging(tensor, reduction=reduction)
+            for name, tensor in self.get_final_solver_coeff_tensors().items()
+        }
+
+    def get_final_solver_coeff_grads_for_logging(
+        self,
+        reduction: str = "mean",
+    ) -> Dict[str, np.ndarray]:
+        out: Dict[str, np.ndarray] = {}
+        for name, tensor in self.get_final_solver_coeff_tensors().items():
+            if tensor.grad is not None:
+                out[name] = self._reduce_coeff_tensor_for_logging(tensor.grad, reduction=reduction)
+        return out
+
+    def _record_stepwise_vis_trace(self, step_idx: int, buffers: Dict[str, torch.Tensor]) -> None:
+        if self._stepwise_vis_trace is None or not buffers:
+            return
+        ref = next(iter(buffers.values()))
+        for name, buf in buffers.items():
+            if not isinstance(buf, torch.Tensor):
+                continue
+            if buf.ndim == 2:
+                col = min(step_idx, buf.shape[1] - 1)
+                val = buf[:, col].detach().float().mean().item()
+            elif buf.ndim == 1:
+                col = min(step_idx, buf.shape[0] - 1)
+                val = buf[col].detach().float().item()
+            else:
+                val = buf.detach().float().mean().item()
+            self._stepwise_vis_trace.setdefault(name, []).append(val)
+        t_current = self._get_step_time(
+            step_idx,
+            batch_size=ref.shape[0],
+            device=ref.device,
+            dtype=ref.dtype,
+        )
+        self._stepwise_vis_trace.setdefault("t_current", []).append(
+            float(t_current.detach().float().mean().item())
+        )
+
     def _a_has_diff_baseline(self) -> bool:
         return self.a_parametrization in ("diff", "film_mlp_diff", "diff_transformer")
 
@@ -519,7 +624,7 @@ class GSWrapper(nn.Module):
         if self._stepwise_coeff_buffers is None:
             return
         for name, buf in self._stepwise_coeff_buffers.items():
-            self.solver.__setattr__(name, buf)
+            self._attach_solver_coeff(name, buf)
 
     def _get_step_time(
         self,
@@ -576,6 +681,7 @@ class GSWrapper(nn.Module):
 
         self._stepwise_coeff_buffers = buffers
         self._assign_stepwise_buffers_to_solver()
+        self._record_stepwise_vis_trace(step_idx, buffers)
 
     def _update_dynamic_t_couple(
         self,
@@ -590,7 +696,7 @@ class GSWrapper(nn.Module):
             t_couple = self.t_couple_model(shuffled_noise, shuffled_cond_emb)
         else:
             t_couple = self._t_couple_bias.reshape(1, self.steps)
-        self.solver.t_couple = t_couple
+        self._attach_solver_coeff("t_couple", t_couple)
 
     def _update_dynamic_ac_coefs(
         self,
@@ -611,7 +717,7 @@ class GSWrapper(nn.Module):
                 else:
                     a_all = self._a_bias.unsqueeze(0).expand(noise.shape[0], -1, -1)
                 for i in range(1, self.order+1):
-                    self.solver.__setattr__(f"a{i}_diff", a_all[:, i-1, :])
+                    self._attach_solver_coeff(f"a{i}_diff", a_all[:, i-1, :])
 
                 if self.c_parametrization in ("film_mlp_diff", "diff_transformer"):
                     base_c = torch.stack([getattr(self, f'c{i}_diff') for i in range(1, self.order+1)], dim=0)
@@ -619,7 +725,7 @@ class GSWrapper(nn.Module):
                 else:
                     c_all = self._c_bias.unsqueeze(0).expand(noise.shape[0], -1, -1)
                 for i in range(1, self.order+1):
-                    self.solver.__setattr__(f"c{i}_diff", c_all[:, i-1, :])
+                    self._attach_solver_coeff(f"c{i}_diff", c_all[:, i-1, :])
                 return
 
             # Активный режим
@@ -637,7 +743,7 @@ class GSWrapper(nn.Module):
             else:
                 a_all = a_flat.reshape(noise.shape[0], self.order, self.steps)
             for i in range(1, self.order+1):
-                self.solver.__setattr__(f"a{i}_diff", a_all[:, i-1, :])
+                self._attach_solver_coeff(f"a{i}_diff", a_all[:, i-1, :])
 
             # Применяем c
             if self.c_parametrization in ("film_mlp_diff", "diff_transformer"):
@@ -646,7 +752,7 @@ class GSWrapper(nn.Module):
             else:
                 c_all = c_flat.reshape(noise.shape[0], self.order, self.steps)
             for i in range(1, self.order+1):
-                self.solver.__setattr__(f"c{i}_diff", c_all[:, i-1, :])
+                self._attach_solver_coeff(f"c{i}_diff", c_all[:, i-1, :])
             return
         
         if self.a_parametrization not in ("diff", "film_mlp_diff", "diff_transformer"):
@@ -667,7 +773,7 @@ class GSWrapper(nn.Module):
             a_all = a_flat.reshape(a_flat.shape[0], self.order, self.steps)
             
             for i in range(1, self.order + 1):
-                self.solver.__setattr__(f"a{i}_diff", a_all[:, i - 1, :])
+                self._attach_solver_coeff(f"a{i}_diff", a_all[:, i - 1, :])
         elif self.a_parametrization == "film_mlp_diff":
             # ⭐ Режим diff + residual из MLP
             base_a = torch.stack([getattr(self, f'a{i}_diff') for i in range(1, self.order+1)], dim=0)
@@ -687,7 +793,7 @@ class GSWrapper(nn.Module):
                 a_all = base_a.unsqueeze(0).expand(noise.shape[0], -1, -1)
 
             for i in range(1, self.order+1):
-                self.solver.__setattr__(f"a{i}_diff", a_all[:, i-1, :])
+                self._attach_solver_coeff(f"a{i}_diff", a_all[:, i-1, :])
         elif self.a_parametrization == "diff_transformer":
             # ⭐ Режим diff + transformer residual
             base_a = torch.stack([getattr(self, f'a{i}_diff') for i in range(1, self.order+1)], dim=0)
@@ -707,7 +813,7 @@ class GSWrapper(nn.Module):
                 a_all = base_a.unsqueeze(0).expand(noise.shape[0], -1, -1)
 
             for i in range(1, self.order+1):
-                self.solver.__setattr__(f"a{i}_diff", a_all[:, i-1, :])
+                self._attach_solver_coeff(f"a{i}_diff", a_all[:, i-1, :])
         
         if self.c_parametrization not in ("diff", "film_mlp_diff", "diff_transformer"):
             out_dim = self.order * self.steps
@@ -727,7 +833,7 @@ class GSWrapper(nn.Module):
             c_all = c_flat.reshape(c_flat.shape[0], self.order, self.steps)
             
             for i in range(1, self.order + 1):
-                self.solver.__setattr__(f"c{i}_diff", c_all[:, i - 1, :])
+                self._attach_solver_coeff(f"c{i}_diff", c_all[:, i - 1, :])
         elif self.c_parametrization == "film_mlp_diff":  # ⭐ ИСПРАВЛЕНО: было a_parametrization
             # ⭐ Режим diff + residual из MLP
             base_c = torch.stack([getattr(self, f'c{i}_diff') for i in range(1, self.order+1)], dim=0)
@@ -747,7 +853,7 @@ class GSWrapper(nn.Module):
                 c_all = base_c.unsqueeze(0).expand(noise.shape[0], -1, -1)
 
             for i in range(1, self.order+1):
-                self.solver.__setattr__(f"c{i}_diff", c_all[:, i-1, :])
+                self._attach_solver_coeff(f"c{i}_diff", c_all[:, i-1, :])
         elif self.c_parametrization == "diff_transformer":
             # ⭐ Режим diff + transformer residual
             base_c = torch.stack([getattr(self, f'c{i}_diff') for i in range(1, self.order+1)], dim=0)
@@ -767,7 +873,7 @@ class GSWrapper(nn.Module):
                 c_all = base_c.unsqueeze(0).expand(noise.shape[0], -1, -1)
 
             for i in range(1, self.order+1):
-                self.solver.__setattr__(f"c{i}_diff", c_all[:, i-1, :])
+                self._attach_solver_coeff(f"c{i}_diff", c_all[:, i-1, :])
 
     # timesteps logic
     def get_t_steps(self, noise=None, cond_emb=None, **kwargs) -> torch.Tensor:

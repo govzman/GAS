@@ -1,10 +1,145 @@
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+from typing import Dict, List, Mapping, Optional, Union
 from torchvision.utils import make_grid
 
 import comet_ml
 from src.model.gas.gs_wrapper import GSWrapper
+
+CoeffArray = Union[np.ndarray, torch.Tensor]
+
+
+def _to_numpy_1d(data: CoeffArray) -> np.ndarray:
+    if isinstance(data, torch.Tensor):
+        data = data.detach().float().cpu().numpy()
+    else:
+        data = np.asarray(data, dtype=np.float64)
+    return np.atleast_1d(data).reshape(-1)
+
+
+def reduce_coeff_tensor(
+    tensor: torch.Tensor,
+    reduction: str = "mean",
+) -> np.ndarray:
+    """Reduce batch-dependent solver coeffs to a 1D per-step vector for logging."""
+    t = tensor.detach().float()
+    if t.ndim == 0:
+        return t.cpu().numpy().reshape(1)
+    if t.ndim == 1:
+        return t.cpu().numpy()
+    if reduction == "batch0":
+        return t[0].cpu().numpy()
+    return t.mean(dim=0).cpu().numpy()
+
+
+def coeffs_to_metric_dict(
+    coeffs: Mapping[str, CoeffArray],
+    prefix: str,
+    suff: str = "",
+) -> Dict[str, float]:
+    """Build Comet scalars: ``{prefix}{name}/{step:02d}`` (e.g. weights_stats_a1_diff/00)."""
+    d: Dict[str, float] = {}
+    key_base = f"{prefix}{suff}"
+    for name, values in coeffs.items():
+        arr = _to_numpy_1d(values)
+        if arr.size > 12:
+            d[f"{key_base}/{name}_norm"] = float(np.linalg.norm(arr))
+            continue
+        for i, v in enumerate(arr):
+            d[f"{key_base}_{name}/{i:02d}"] = float(v)
+    return d
+
+
+def print_final_solver_coeffs(
+    coeffs: Mapping[str, CoeffArray],
+    header: str = "",
+    reduction_label: str = "batch-mean",
+) -> None:
+    lines = []
+    if header:
+        lines.append(header)
+    lines.append(f"=== final solver coefficients ({reduction_label}) ===")
+    for name in sorted(coeffs.keys()):
+        arr = _to_numpy_1d(coeffs[name])
+        if arr.size <= 8:
+            vals = ", ".join(f"{v:.6g}" for v in arr)
+        else:
+            vals = (
+                f"[{', '.join(f'{v:.6g}' for v in arr[:4])}, ..., "
+                f"{', '.join(f'{v:.6g}' for v in arr[-2:])}] (n={arr.size})"
+            )
+        lines.append(f"  {name}: {vals}")
+    print("\n".join(lines))
+
+
+@torch.no_grad()
+def log_final_solver_coeffs(
+    exp: comet_ml.Experiment,
+    coeffs: Mapping[str, CoeffArray],
+    global_step: int,
+    suff: str = "",
+    prefix: str = "weights_stats",
+) -> None:
+    exp.log_metrics(coeffs_to_metric_dict(coeffs, prefix=prefix, suff=suff), step=global_step)
+
+
+def log_final_solver_grads(
+    exp: comet_ml.Experiment,
+    grads: Mapping[str, CoeffArray],
+    global_step: int,
+    suff: str = "",
+    prefix: str = "grad_stats",
+) -> None:
+    if not grads:
+        return
+    exp.log_metrics(coeffs_to_metric_dict(grads, prefix=prefix, suff=suff), step=global_step)
+
+
+@torch.no_grad()
+def log_stepwise_vis_metrics(
+    exp: comet_ml.Experiment,
+    trace: Mapping[str, List[float]],
+    global_step: int,
+    key_prefix: str = "stepwise_vis",
+    suff: str = "",
+) -> None:
+    """Log per-solver-step scalar traces collected on the vis batch."""
+    d: Dict[str, float] = {}
+    prefix = f"{key_prefix}{suff}"
+    for name, values in trace.items():
+        if not values:
+            continue
+        arr = np.asarray(values, dtype=np.float64)
+        for step_i, v in enumerate(arr):
+            d[f"{prefix}/{name}/step_{step_i:02d}"] = float(v)
+        d[f"{prefix}/{name}/mean"] = float(arr.mean())
+        d[f"{prefix}/{name}/std"] = float(arr.std()) if arr.size > 1 else 0.0
+        d[f"{prefix}/{name}/delta_last"] = float(arr[-1] - arr[0]) if arr.size > 1 else 0.0
+    if d:
+        exp.log_metrics(d, step=global_step)
+
+
+@torch.no_grad()
+def log_stepwise_vis_plot(
+    exp: comet_ml.Experiment,
+    trace: Mapping[str, List[float]],
+    global_step: int,
+    key: str = "stepwise_vis/trajectory",
+) -> None:
+    if not trace:
+        return
+    fig, ax = plt.subplots(1, 1, figsize=(8, 4))
+    for name, values in sorted(trace.items()):
+        if not values:
+            continue
+        ax.plot(values, marker="o", markersize=3, label=name, alpha=0.85)
+    ax.set_xlabel("Solver step")
+    ax.set_ylabel("Coefficient (batch mean)")
+    ax.set_title("Stepwise coefficient trajectory (vis batch)")
+    ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=8, ncol=2)
+    log_plt_fig(exp=exp, fig=fig, key=key, global_step=global_step)
 
 
 def log_plt_fig(exp: comet_ml.Experiment, fig, key: str, global_step: int) -> None:
@@ -15,7 +150,6 @@ def log_plt_fig(exp: comet_ml.Experiment, fig, key: str, global_step: int) -> No
         figure_name=key,
         step=global_step,
     )
-    # comet_ml.log_metrics({key: comet_ml.Image(fig)}, step=global_step)
     plt.close("all")
 
 
@@ -116,11 +250,19 @@ def log_weights(exp: comet_ml.Experiment, model: GSWrapper, global_step: int, su
     exp.log_metrics(d, step=global_step)
 
 
-@torch.no_grad()
-def log_grads(exp: comet_ml.Experiment, model: GSWrapper, global_step: int) -> None:
+def log_grads(
+    exp: comet_ml.Experiment,
+    model: GSWrapper,
+    global_step: int,
+    suff: str = "",
+    solver_grads: Optional[Mapping[str, CoeffArray]] = None,
+) -> None:
     d = {}
-    key = "grads_stats"
+    key = f"grad_stats{suff}"
+    skip_param_names = set(solver_grads.keys()) if solver_grads and model.should_log_final_solver_coeffs() else set()
     for t, p in model.named_parameters():
+        if t in skip_param_names:
+            continue
         if p.requires_grad and p.grad is not None:
             data = p.grad.detach().clone().cpu().numpy()
             if data.ndim == 0:
@@ -132,7 +274,11 @@ def log_grads(exp: comet_ml.Experiment, model: GSWrapper, global_step: int) -> N
             for i, v in enumerate(data):
                 d[f"{key}_{t}/{i:02d}"] = v
 
-    exp.log_metrics(d, step=global_step)
+    if solver_grads:
+        d.update(coeffs_to_metric_dict(solver_grads, prefix=key, suff=""))
+
+    if d:
+        exp.log_metrics(d, step=global_step)
 
 
 @torch.no_grad()
