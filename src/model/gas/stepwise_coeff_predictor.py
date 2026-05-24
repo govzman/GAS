@@ -73,15 +73,14 @@ class StepwiseCoeffPredictor(nn.Module):
             nn.Linear(time_embed_dim, hidden_dim),
         )
         self.film = nn.Linear(hidden_dim, 2 * hidden_dim)
-        nn.init.zeros_(self.film.weight)
+        nn.init.normal_(self.film.weight, std=0.01)
         nn.init.zeros_(self.film.bias)
 
-        self.out_norm = nn.LayerNorm(hidden_dim)
         self.a_head = nn.Linear(hidden_dim, order)
         self.c_head = nn.Linear(hidden_dim, order)
-        nn.init.zeros_(self.a_head.weight)
+        nn.init.normal_(self.a_head.weight, std=0.01)
         nn.init.zeros_(self.a_head.bias)
-        nn.init.zeros_(self.c_head.weight)
+        nn.init.normal_(self.c_head.weight, std=0.01)
         nn.init.zeros_(self.c_head.bias)
 
     def forward(

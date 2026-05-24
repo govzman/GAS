@@ -257,10 +257,11 @@ def train(
                     log_d[f"train/{k}"] = v.mean().item()
 
             if log_solver_coeffs:
-                final_coeffs = gs_wrapper.get_final_solver_coeffs_for_logging()
+                final_coeffs = gs_wrapper.get_final_solver_coeff_tensors()  # сырые тензоры
                 print_final_solver_coeffs(
                     final_coeffs,
                     header=f"[train step {global_step}]",
+                    max_samples=2,
                 )
 
             print_every = int(getattr(config.trainer, "print_gt_solver_every", 0))

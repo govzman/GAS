@@ -5,7 +5,14 @@ import torch
 import comet_ml
 from src.model.gas.gs_wrapper import GSWrapper
 from src.model.gas.synt_data import SyntDataLoaders, move_batch_to_device
-from src.model.gas.utils.loggers import log_end_img, log_t_steps_plot
+from src.model.gas.utils.loggers import (
+    log_end_img,
+    log_final_solver_coeffs,
+    log_stepwise_vis_metrics,
+    log_stepwise_vis_plot,
+    log_t_steps_plot,
+    print_final_solver_coeffs,
+)
 
 NOT_LOG_KEYS = ["timesteps", "x0_s", "x0_t", "latents_s"]
 
@@ -24,7 +31,38 @@ def evaluate_wrapper(
 
     d_res = {}
 
+    if gs_wrapper.use_stepwise_coeff:
+        gs_wrapper.enable_stepwise_vis_trace(True)
+
     out_d = gs_wrapper.forward(batch=batch, return_timesteps=True, is_train=False)
+
+    stepwise_trace = gs_wrapper.consume_stepwise_vis_trace()
+    if stepwise_trace:
+        log_stepwise_vis_metrics(
+            exp=exp,
+            trace=stepwise_trace,
+            global_step=global_step,
+            suff=suff,
+        )
+        log_stepwise_vis_plot(
+            exp=exp,
+            trace=stepwise_trace,
+            global_step=global_step,
+            key=f"stepwise_vis{suff}/trajectory",
+        )
+
+    if gs_wrapper.should_log_final_solver_coeffs():
+        final_coeffs = gs_wrapper.get_final_solver_coeffs_for_logging()
+        print_final_solver_coeffs(
+            final_coeffs,
+            header=f"[eval vis step {global_step}{suff}]",
+        )
+        log_final_solver_coeffs(
+            exp,
+            final_coeffs,
+            global_step=global_step,
+            suff=suff,
+        )
     log_t_steps_plot(
         exp=exp,
         t_steps=out_d["timesteps"],

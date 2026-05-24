@@ -55,21 +55,30 @@ def print_final_solver_coeffs(
     coeffs: Mapping[str, CoeffArray],
     header: str = "",
     reduction_label: str = "batch-mean",
+    max_samples: int = 0,
 ) -> None:
     lines = []
     if header:
         lines.append(header)
     lines.append(f"=== final solver coefficients ({reduction_label}) ===")
     for name in sorted(coeffs.keys()):
-        arr = _to_numpy_1d(coeffs[name])
-        if arr.size <= 8:
-            vals = ", ".join(f"{v:.6g}" for v in arr)
+        tensor_or_arr = coeffs[name]
+        if isinstance(tensor_or_arr, torch.Tensor) and tensor_or_arr.ndim == 2 and max_samples > 0:
+            t = tensor_or_arr.detach().cpu().numpy()
+            samples_to_show = min(max_samples, t.shape[0])
+            for b in range(samples_to_show):
+                vals = ", ".join(f"{v:.6g}" for v in t[b])
+                lines.append(f"  {name}[{b}]: {vals}")
         else:
-            vals = (
-                f"[{', '.join(f'{v:.6g}' for v in arr[:4])}, ..., "
-                f"{', '.join(f'{v:.6g}' for v in arr[-2:])}] (n={arr.size})"
-            )
-        lines.append(f"  {name}: {vals}")
+            arr = _to_numpy_1d(tensor_or_arr)
+            if arr.size <= 8:
+                vals = ", ".join(f"{v:.6g}" for v in arr)
+            else:
+                vals = (
+                    f"[{', '.join(f'{v:.6g}' for v in arr[:4])}, ..., "
+                    f"{', '.join(f'{v:.6g}' for v in arr[-2:])}] (n={arr.size})"
+                )
+            lines.append(f"  {name}: {vals}")
     print("\n".join(lines))
 
 

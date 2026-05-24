@@ -636,9 +636,15 @@ class GSWrapper(nn.Module):
         timesteps = self._stepwise_sampling_timesteps
         if timesteps is None:
             return torch.zeros(batch_size, device=device, dtype=dtype)
+        target_idx = step_idx + 1  # шаг, для которого предсказываем
         if timesteps.ndim == 2:
-            return timesteps[:, step_idx].to(device=device, dtype=dtype)
-        return timesteps[step_idx].expand(batch_size).to(device=device, dtype=dtype)
+            if target_idx >= timesteps.shape[1]:
+                target_idx = timesteps.shape[1] - 1
+            return timesteps[:, target_idx].to(device=device, dtype=dtype)
+        else:
+            if target_idx >= timesteps.shape[0]:
+                target_idx = timesteps.shape[0] - 1
+            return timesteps[target_idx].expand(batch_size).to(device=device, dtype=dtype)
 
     def _update_stepwise_coeffs(
         self,
@@ -646,42 +652,59 @@ class GSWrapper(nn.Module):
         x_t: torch.Tensor,
         cond_emb: Optional[torch.Tensor],
     ) -> None:
-        """Predict and attach coefficients for the current solver step (no in-place buffer writes)."""
-        batch_size = x_t.shape[0]
-        device, dtype = x_t.device, x_t.dtype
+        batch_size, device, dtype = x_t.shape[0], x_t.device, x_t.dtype
+
+        # Инициализация списков при первом вызове
+        if step_idx == 0:
+            self._stepwise_a_preds = [None] * self.steps
+            self._stepwise_c_preds = [None] * self.steps
+            # Строим начальные матрицы только из базовых параметров
+            for i in range(1, self.order + 1):
+                base_a = getattr(self, f"a{i}_diff")  # (steps,)
+                base_c = getattr(self, f"c{i}_diff")
+                a_mat = base_a.unsqueeze(0).expand(batch_size, -1).clone()
+                c_mat = base_c.unsqueeze(0).expand(batch_size, -1).clone()
+                self._attach_solver_coeff(f"a{i}_diff", a_mat)
+                self._attach_solver_coeff(f"c{i}_diff", c_mat)
+            return
 
         if self.mlp_disabled or self.stepwise_predictor is None:
-            if self._stepwise_coeff_buffers is None:
-                self._init_coeff_buffers(batch_size, device, dtype)
             return
 
         shuffled_x, shuffled_cond = self._get_shuffled_inputs_for_coefficients(x_t, cond_emb)
         if shuffled_cond is None:
             return
 
+        # Предсказание для текущего шага
         t_current = self._get_step_time(step_idx, batch_size, device, dtype)
-        a_pred, c_pred = self.stepwise_predictor(shuffled_x, t_current, shuffled_cond)
+        a_pred, c_pred = self.stepwise_predictor(shuffled_x, t_current, shuffled_cond)  # (B, order)
 
-        # Rebuild (B, steps) tables each call. _get_step_param reads column params_step;
-        # broadcasting the current-step value avoids in-place mutation that breaks backward.
-        buffers: Dict[str, torch.Tensor] = {}
+        # Сохраняем в списки
         for i in range(1, self.order + 1):
-            a_name = f"a{i}_diff"
-            c_name = f"c{i}_diff"
-            if self._a_has_diff_baseline():
-                a_val = getattr(self, a_name)[step_idx] + a_pred[:, i - 1]
-            else:
-                a_val = a_pred[:, i - 1]
-            if self._c_has_diff_baseline():
-                c_val = getattr(self, c_name)[step_idx] + c_pred[:, i - 1]
-            else:
-                c_val = c_pred[:, i - 1]
-            buffers[a_name] = a_val.unsqueeze(1).expand(batch_size, self.steps)
-            buffers[c_name] = c_val.unsqueeze(1).expand(batch_size, self.steps)
+            self._stepwise_a_preds[step_idx] = a_pred[:, i - 1]
+            self._stepwise_c_preds[step_idx] = c_pred[:, i - 1]
 
-        self._stepwise_coeff_buffers = buffers
-        self._assign_stepwise_buffers_to_solver()
-        self._record_stepwise_vis_trace(step_idx, buffers)
+        # Перестраиваем ВСЕ матрицы с учётом накопленных предсказаний
+        for i in range(1, self.order + 1):
+            base_a = getattr(self, f"a{i}_diff")  # (steps,)
+            base_c = getattr(self, f"c{i}_diff")
+
+            # Собираем столбцы для каждого шага
+            a_cols, c_cols = [], []
+            for s in range(self.steps):
+                if self._stepwise_a_preds[s] is not None:
+                    a_cols.append(base_a[s] + self._stepwise_a_preds[s])
+                else:
+                    a_cols.append(base_a[s].expand(batch_size))
+                if self._stepwise_c_preds[s] is not None:
+                    c_cols.append(base_c[s] + self._stepwise_c_preds[s])
+                else:
+                    c_cols.append(base_c[s].expand(batch_size))
+
+            a_mat = torch.stack(a_cols, dim=1)  # (B, steps)
+            c_mat = torch.stack(c_cols, dim=1)
+            self._attach_solver_coeff(f"a{i}_diff", a_mat)
+            self._attach_solver_coeff(f"c{i}_diff", c_mat)
 
     def _update_dynamic_t_couple(
         self,
