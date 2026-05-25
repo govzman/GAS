@@ -112,5 +112,5 @@ class StepwiseCoeffPredictor(nn.Module):
         ht = self.time_mlp(t_in.to(dtype=hp.dtype, device=hp.device))
 
         gamma, beta = self.film(hn + ht).chunk(2, dim=1)
-        h = self.out_norm(hp * (1.0 + gamma) + beta)
+        h = hp * (1.0 + gamma) + beta
         return self.a_head(h), self.c_head(h)

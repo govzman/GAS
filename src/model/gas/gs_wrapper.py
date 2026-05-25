@@ -137,6 +137,7 @@ class GSWrapper(nn.Module):
         self.stepwise_predictor: Optional[StepwiseCoeffPredictor] = None
         self._stepwise_coeff_buffers: Optional[Dict[str, torch.Tensor]] = None
         self._stepwise_sampling_timesteps: Optional[torch.Tensor] = None
+        self._stepwise_live_coeffs: Dict[str, torch.Tensor] = {}
         self._stepwise_vis_trace: Optional[Dict[str, List[float]]] = None
         self._retain_solver_coeff_grads: bool = False
 
@@ -516,8 +517,7 @@ class GSWrapper(nn.Module):
         self._stepwise_coeff_buffers = None
         self._stepwise_sampling_timesteps = None
         self._stepwise_base_coeffs = None
-        self._stepwise_a_preds = None
-        self._stepwise_c_preds = None
+        self._stepwise_live_coeffs = {}
 
     def should_log_final_solver_coeffs(self) -> bool:
         """True when effective coeffs live on the solver (not only static diff Parameters)."""
@@ -639,17 +639,17 @@ class GSWrapper(nn.Module):
         """Build (B, steps) baseline table for stepwise sampling."""
         if has_diff_baseline:
             base = getattr(self, name)  # (steps,)
-            return base.unsqueeze(0).expand(batch_size, -1).clone().to(device=device, dtype=dtype)
+            return base.unsqueeze(0).expand(batch_size, -1).to(device=device, dtype=dtype)
 
         solver_val = getattr(self.solver, name, None)
         if isinstance(solver_val, torch.Tensor):
             if solver_val.ndim == 2:
                 if solver_val.shape[0] == batch_size:
-                    return solver_val.clone().to(device=device, dtype=dtype)
+                    return solver_val.to(device=device, dtype=dtype)
                 if solver_val.shape[0] == 1:
-                    return solver_val.expand(batch_size, -1).clone().to(device=device, dtype=dtype)
+                    return solver_val.expand(batch_size, -1).to(device=device, dtype=dtype)
             if solver_val.ndim == 1:
-                return solver_val.unsqueeze(0).expand(batch_size, -1).clone().to(device=device, dtype=dtype)
+                return solver_val.unsqueeze(0).expand(batch_size, -1).to(device=device, dtype=dtype)
 
         return torch.zeros(batch_size, self.steps, device=device, dtype=dtype)
 
@@ -710,65 +710,72 @@ class GSWrapper(nn.Module):
                 target_idx = timesteps.shape[0] - 1
             return timesteps[target_idx].expand(batch_size).to(device=device, dtype=dtype)
 
+    def _get_base_coeff_at_step(
+        self,
+        name: str,
+        step_idx: int,
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Возвращает базовый коэффициент для конкретного шага как (B,) тензор."""
+        if self._a_has_diff_baseline() and name.startswith("a"):
+            param = getattr(self, name)          # nn.Parameter (steps,)
+            val = param[step_idx]                # скаляр с градиентом
+            return val.expand(batch_size).to(device=device, dtype=dtype)
+        if self._c_has_diff_baseline() and name.startswith("c"):
+            param = getattr(self, name)
+            val = param[step_idx]
+            return val.expand(batch_size).to(device=device, dtype=dtype)
+        # Иначе — берём из solver (там уже лежит (B, steps) без clone)
+        solver_val = getattr(self.solver, name, None)
+        if isinstance(solver_val, torch.Tensor):
+            if solver_val.ndim == 2:
+                return solver_val[:, step_idx].to(device=device, dtype=dtype)
+            if solver_val.ndim == 1:
+                return solver_val[step_idx].expand(batch_size).to(device=device, dtype=dtype)
+        return torch.zeros(batch_size, device=device, dtype=dtype)
+
     def _update_stepwise_coeffs(
         self,
         step_idx: int,
         x_t: torch.Tensor,
         cond_emb: Optional[torch.Tensor],
     ) -> None:
-        batch_size, device, dtype = x_t.shape[0], x_t.device, x_t.dtype
-
-        # Инициализация списков при первом вызове
+        """
+        Предсказываем коэффициенты для шага step_idx и кладём их в
+        self._stepwise_live_coeffs — dict {name: (B,) tensor}.
+        solver._get_step_param читает оттуда, если там что-то есть.
+        """
+        # На шаге 0 сбрасываем live-буфер
         if step_idx == 0:
-            self._stepwise_a_preds = [None] * self.steps
-            self._stepwise_c_preds = [None] * self.steps
-            self._stepwise_base_coeffs = self._build_stepwise_base_coeffs(
-                batch_size, device, dtype
-            )
-            for name, mat in self._stepwise_base_coeffs.items():
-                self._attach_solver_coeff(name, mat)
+            self._stepwise_live_coeffs: Dict[str, torch.Tensor] = {}
             return
 
         if self.mlp_disabled or self.stepwise_predictor is None:
+            self._stepwise_live_coeffs = {}
             return
 
         shuffled_x, shuffled_cond = self._get_shuffled_inputs_for_coefficients(x_t, cond_emb)
         if shuffled_cond is None:
+            self._stepwise_live_coeffs = {}
             return
 
-        # Предсказание для текущего шага
+        batch_size, device, dtype = x_t.shape[0], x_t.device, x_t.dtype
         t_current = self._get_step_time(step_idx, batch_size, device, dtype)
-        a_pred, c_pred = self.stepwise_predictor(shuffled_x, t_current, shuffled_cond)  # (B, order)
 
-        # Сохраняем в списки
+        # a_pred/c_pred: (B, order) — delta поверх базовых коэффициентов
+        a_pred, c_pred = self.stepwise_predictor(shuffled_x, t_current, shuffled_cond)
+
+        live: Dict[str, torch.Tensor] = {}
         for i in range(1, self.order + 1):
-            self._stepwise_a_preds[step_idx] = a_pred[:, i - 1]
-            self._stepwise_c_preds[step_idx] = c_pred[:, i - 1]
+            # Базовый коэффициент для этого шага — скаляр или (B,)
+            base_a = self._get_base_coeff_at_step(f"a{i}_diff", step_idx, batch_size, device, dtype)
+            base_c = self._get_base_coeff_at_step(f"c{i}_diff", step_idx, batch_size, device, dtype)
+            live[f"a{i}_diff"] = base_a + a_pred[:, i - 1]   # (B,)
+            live[f"c{i}_diff"] = base_c + c_pred[:, i - 1]   # (B,)
 
-        # Перестраиваем ВСЕ матрицы с учётом накопленных предсказаний
-        base_coeffs = self._stepwise_base_coeffs or {}
-        for i in range(1, self.order + 1):
-            base_a = base_coeffs.get(f"a{i}_diff")
-            base_c = base_coeffs.get(f"c{i}_diff")
-            if base_a is None or base_c is None:
-                continue
-
-            # Собираем столбцы для каждого шага
-            a_cols, c_cols = [], []
-            for s in range(self.steps):
-                if self._stepwise_a_preds[s] is not None:
-                    a_cols.append(base_a[:, s] + self._stepwise_a_preds[s])
-                else:
-                    a_cols.append(base_a[:, s])
-                if self._stepwise_c_preds[s] is not None:
-                    c_cols.append(base_c[:, s] + self._stepwise_c_preds[s])
-                else:
-                    c_cols.append(base_c[:, s])
-
-            a_mat = torch.stack(a_cols, dim=1)  # (B, steps)
-            c_mat = torch.stack(c_cols, dim=1)
-            self._attach_solver_coeff(f"a{i}_diff", a_mat)
-            self._attach_solver_coeff(f"c{i}_diff", c_mat)
+        self._stepwise_live_coeffs = live
 
     def _update_dynamic_t_couple(
         self,
@@ -1166,6 +1173,15 @@ class GSWrapper(nn.Module):
 
                     def before_step_fn(step_idx: int, x: torch.Tensor) -> None:
                         self._update_stepwise_coeffs(step_idx, x, cond_emb)
+                        # После обновления live-dict — пишем в solver только скалярные/батчевые
+                        # коэффициенты для текущего шага (не всю матрицу)
+                        live = getattr(self, "_stepwise_live_coeffs", {})
+                        for name, val in live.items():
+                            # val: (B,) — solver._get_step_param ожидает либо (steps,) либо (B, steps)
+                            # Передаём как (B, 1) и выставляем params_step=0, чтобы он брал [:, 0]
+                            self.solver.__setattr__(name, val.unsqueeze(1))   # (B, 1)
+                        if live:
+                            self.solver.params_step = 0   # _get_step_param возьмёт [:, 0]
                 else:
                     self._update_dynamic_t_couple(noise=noise, cond_emb=cond_emb)
                     self._update_dynamic_ac_coefs(noise=noise, cond_emb=cond_emb)
@@ -1294,6 +1310,15 @@ class GSWrapperLatent(GSWrapper):
 
                     def before_step_fn(step_idx: int, x: torch.Tensor) -> None:
                         self._update_stepwise_coeffs(step_idx, x, cond_emb)
+                        # После обновления live-dict — пишем в solver только скалярные/батчевые
+                        # коэффициенты для текущего шага (не всю матрицу)
+                        live = getattr(self, "_stepwise_live_coeffs", {})
+                        for name, val in live.items():
+                            # val: (B,) — solver._get_step_param ожидает либо (steps,) либо (B, steps)
+                            # Передаём как (B, 1) и выставляем params_step=0, чтобы он брал [:, 0]
+                            self.solver.__setattr__(name, val.unsqueeze(1))   # (B, 1)
+                        if live:
+                            self.solver.params_step = 0   # _get_step_param возьмёт [:, 0]
                 else:
                     self._update_dynamic_t_couple(noise=noise, cond_emb=cond_emb)
                     self._update_dynamic_ac_coefs(noise=noise, cond_emb=cond_emb)
