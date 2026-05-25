@@ -490,6 +490,9 @@ class GSWrapper(nn.Module):
     def _clear_stepwise_sampling_state(self) -> None:
         self._stepwise_coeff_buffers = None
         self._stepwise_sampling_timesteps = None
+        self._stepwise_base_coeffs = None
+        self._stepwise_a_preds = None
+        self._stepwise_c_preds = None
 
     def should_log_final_solver_coeffs(self) -> bool:
         """True when effective coeffs live on the solver (not only static diff Parameters)."""
@@ -599,25 +602,61 @@ class GSWrapper(nn.Module):
     def _c_has_diff_baseline(self) -> bool:
         return self.c_parametrization in ("diff", "film_mlp_diff", "diff_transformer")
 
+    def _get_stepwise_base_coeff_matrix(
+        self,
+        name: str,
+        *,
+        has_diff_baseline: bool,
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Build (B, steps) baseline table for stepwise sampling."""
+        if has_diff_baseline:
+            base = getattr(self, name)  # (steps,)
+            return base.unsqueeze(0).expand(batch_size, -1).clone().to(device=device, dtype=dtype)
+
+        solver_val = getattr(self.solver, name, None)
+        if isinstance(solver_val, torch.Tensor):
+            if solver_val.ndim == 2:
+                if solver_val.shape[0] == batch_size:
+                    return solver_val.clone().to(device=device, dtype=dtype)
+                if solver_val.shape[0] == 1:
+                    return solver_val.expand(batch_size, -1).clone().to(device=device, dtype=dtype)
+            if solver_val.ndim == 1:
+                return solver_val.unsqueeze(0).expand(batch_size, -1).clone().to(device=device, dtype=dtype)
+
+        return torch.zeros(batch_size, self.steps, device=device, dtype=dtype)
+
+    def _build_stepwise_base_coeffs(
+        self,
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Dict[str, torch.Tensor]:
+        bases: Dict[str, torch.Tensor] = {}
+        for i in range(1, self.order + 1):
+            bases[f"a{i}_diff"] = self._get_stepwise_base_coeff_matrix(
+                f"a{i}_diff",
+                has_diff_baseline=self._a_has_diff_baseline(),
+                batch_size=batch_size,
+                device=device,
+                dtype=dtype,
+            )
+            bases[f"c{i}_diff"] = self._get_stepwise_base_coeff_matrix(
+                f"c{i}_diff",
+                has_diff_baseline=self._c_has_diff_baseline(),
+                batch_size=batch_size,
+                device=device,
+                dtype=dtype,
+            )
+        return bases
+
     def _init_coeff_buffers(self, batch_size: int, device: torch.device, dtype: torch.dtype) -> None:
         """Allocate (B, steps) coefficient tables for stepwise sampling."""
-        buffers: Dict[str, torch.Tensor] = {}
-        for i in range(1, self.order + 1):
-            a_name = f"a{i}_diff"
-            if self._a_has_diff_baseline():
-                base_a = getattr(self, a_name)
-                buffers[a_name] = base_a.unsqueeze(0).expand(batch_size, -1).clone().to(device=device, dtype=dtype)
-            else:
-                buffers[a_name] = torch.zeros(batch_size, self.steps, device=device, dtype=dtype)
-
-            c_name = f"c{i}_diff"
-            if self._c_has_diff_baseline():
-                base_c = getattr(self, c_name)
-                buffers[c_name] = base_c.unsqueeze(0).expand(batch_size, -1).clone().to(device=device, dtype=dtype)
-            else:
-                buffers[c_name] = torch.zeros(batch_size, self.steps, device=device, dtype=dtype)
-
-        self._stepwise_coeff_buffers = buffers
+        self._stepwise_coeff_buffers = self._build_stepwise_base_coeffs(
+            batch_size, device, dtype
+        )
         self._assign_stepwise_buffers_to_solver()
 
     def _assign_stepwise_buffers_to_solver(self) -> None:
@@ -658,14 +697,11 @@ class GSWrapper(nn.Module):
         if step_idx == 0:
             self._stepwise_a_preds = [None] * self.steps
             self._stepwise_c_preds = [None] * self.steps
-            # Строим начальные матрицы только из базовых параметров
-            for i in range(1, self.order + 1):
-                base_a = getattr(self, f"a{i}_diff")  # (steps,)
-                base_c = getattr(self, f"c{i}_diff")
-                a_mat = base_a.unsqueeze(0).expand(batch_size, -1).clone()
-                c_mat = base_c.unsqueeze(0).expand(batch_size, -1).clone()
-                self._attach_solver_coeff(f"a{i}_diff", a_mat)
-                self._attach_solver_coeff(f"c{i}_diff", c_mat)
+            self._stepwise_base_coeffs = self._build_stepwise_base_coeffs(
+                batch_size, device, dtype
+            )
+            for name, mat in self._stepwise_base_coeffs.items():
+                self._attach_solver_coeff(name, mat)
             return
 
         if self.mlp_disabled or self.stepwise_predictor is None:
@@ -685,21 +721,24 @@ class GSWrapper(nn.Module):
             self._stepwise_c_preds[step_idx] = c_pred[:, i - 1]
 
         # Перестраиваем ВСЕ матрицы с учётом накопленных предсказаний
+        base_coeffs = self._stepwise_base_coeffs or {}
         for i in range(1, self.order + 1):
-            base_a = getattr(self, f"a{i}_diff")  # (steps,)
-            base_c = getattr(self, f"c{i}_diff")
+            base_a = base_coeffs.get(f"a{i}_diff")
+            base_c = base_coeffs.get(f"c{i}_diff")
+            if base_a is None or base_c is None:
+                continue
 
             # Собираем столбцы для каждого шага
             a_cols, c_cols = [], []
             for s in range(self.steps):
                 if self._stepwise_a_preds[s] is not None:
-                    a_cols.append(base_a[s] + self._stepwise_a_preds[s])
+                    a_cols.append(base_a[:, s] + self._stepwise_a_preds[s])
                 else:
-                    a_cols.append(base_a[s].expand(batch_size))
+                    a_cols.append(base_a[:, s])
                 if self._stepwise_c_preds[s] is not None:
-                    c_cols.append(base_c[s] + self._stepwise_c_preds[s])
+                    c_cols.append(base_c[:, s] + self._stepwise_c_preds[s])
                 else:
-                    c_cols.append(base_c[s].expand(batch_size))
+                    c_cols.append(base_c[:, s])
 
             a_mat = torch.stack(a_cols, dim=1)  # (B, steps)
             c_mat = torch.stack(c_cols, dim=1)
@@ -1098,6 +1137,7 @@ class GSWrapper(nn.Module):
                     self._stepwise_sampling_timesteps = self.solver.get_time_steps(noise, cond_emb)
                     self._stepwise_coeff_buffers = None
                     self._update_dynamic_t_couple(noise=noise, cond_emb=cond_emb)
+                    self._update_dynamic_ac_coefs(noise=noise, cond_emb=cond_emb)
 
                     def before_step_fn(step_idx: int, x: torch.Tensor) -> None:
                         self._update_stepwise_coeffs(step_idx, x, cond_emb)
@@ -1225,6 +1265,7 @@ class GSWrapperLatent(GSWrapper):
                     self._stepwise_sampling_timesteps = self.solver.get_time_steps(noise, cond_emb)
                     self._stepwise_coeff_buffers = None
                     self._update_dynamic_t_couple(noise=noise, cond_emb=cond_emb)
+                    self._update_dynamic_ac_coefs(noise=noise, cond_emb=cond_emb)
 
                     def before_step_fn(step_idx: int, x: torch.Tensor) -> None:
                         self._update_stepwise_coeffs(step_idx, x, cond_emb)
