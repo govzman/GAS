@@ -144,6 +144,8 @@ class GSWrapper(nn.Module):
         solver = self.get_base_solver()
         self.steps = self.solver_config.steps
         self.order = self.solver_config.order
+        self.latent_channels = int(getattr(self.solver_config, "latent_channels", 4))
+        self.text_embed_dim = int(getattr(self.solver_config, "text_embed_dim", 768))
 
         # init t steps
         self.eps_mu_offset = 1e-5
@@ -160,17 +162,17 @@ class GSWrapper(nn.Module):
             self.mu_logit.data = self.get_inv_t_steps(t_unif)
         elif self.t_parametrization in ("film_mlp", "prompt_noise_film_mlp"):
             hidden_dim = int(getattr(self.solver_config, "t_film_hidden_dim", 256))
-            self.mu_logit = PromptNoiseFiLMMlp(out_dim=self.steps - 1, hidden_dim=hidden_dim)
+            self.mu_logit = PromptNoiseFiLMMlp(
+                out_dim=self.steps - 1,
+                hidden_dim=hidden_dim,
+                in_channels=self.latent_channels,
+            )
         elif self.t_parametrization == "transformer":
-            self.mu_logit = instantiate(config.scheduler_model)
+            self.mu_logit = self._instantiate_with_latent_channels(config.scheduler_model)
         else:
             raise ValueError(f"Unsupported t_parametrization={self.t_parametrization}")
 
         solver.get_time_steps = lambda *args, **kwargs: self.get_t_steps(*args, **kwargs)
-
-        # shared dimensions for conditional predictors
-        self.latent_channels = int(getattr(self.solver_config, "latent_channels", 4))
-        self.text_embed_dim = int(getattr(self.solver_config, "text_embed_dim", 768))
 
         self.use_shared_ac_backbone = getattr(self.solver_config, "use_shared_ac_backbone", False)
         if self.use_stepwise_coeff:
@@ -233,7 +235,11 @@ class GSWrapper(nn.Module):
         else:
             if self.t_couple_parametrization in ("film_mlp", "prompt_noise_film_mlp"):
                 hidden_dim = int(getattr(self.solver_config, "t_couple_film_hidden_dim", 256))
-                self.t_couple_model = PromptNoiseFiLMMlp(out_dim=self.steps, hidden_dim=hidden_dim)
+                self.t_couple_model = PromptNoiseFiLMMlp(
+                    out_dim=self.steps,
+                    hidden_dim=hidden_dim,
+                    in_channels=self.latent_channels,
+                )
             else:
                 raise ValueError(f"Unsupported t_couple_parametrization={self.t_couple_parametrization}")
 
@@ -255,23 +261,27 @@ class GSWrapper(nn.Module):
             out_dim = self.order * self.steps
             if self.a_parametrization == "film_mlp_diff":
                 hidden_dim = int(getattr(self.solver_config, "a_film_hidden_dim", 256))
-                self.a_diff_model = PromptNoiseFiLMMlp(out_dim=out_dim, hidden_dim=hidden_dim)
+                self.a_diff_model = PromptNoiseFiLMMlp(
+                    out_dim=out_dim,
+                    hidden_dim=hidden_dim,
+                    in_channels=self.latent_channels,
+                )
             elif self.a_parametrization == "transformer":
                 a_cfg = getattr(config, "a_scheduler_model", None)
                 if a_cfg is None:
                     a_cfg = config.scheduler_model
-                self.a_diff_model = instantiate(a_cfg, num_timesteps=out_dim)
+                self.a_diff_model = self._instantiate_with_latent_channels(a_cfg, num_timesteps=out_dim)
             elif self.a_parametrization == "film_mlp":
                 a_cfg = getattr(config, "a_scheduler_model", None)
                 if a_cfg is None:
                     a_cfg = config.scheduler_model
-                self.a_diff_model = instantiate(a_cfg)
+                self.a_diff_model = self._instantiate_with_latent_channels(a_cfg)
             elif self.a_parametrization == "diff_transformer":
                 # ⭐ Новая параметризация: diff + transformer residual
                 a_cfg = getattr(config, "a_scheduler_model", None)
                 if a_cfg is None:
                     a_cfg = config.scheduler_model
-                self.a_diff_model = instantiate(a_cfg, num_timesteps=out_dim)
+                self.a_diff_model = self._instantiate_with_latent_channels(a_cfg, num_timesteps=out_dim)
             else:
                 raise ValueError(f"Unsupported a_parametrization={self.a_parametrization}")
             self._a_bias = nn.Parameter(
@@ -283,23 +293,27 @@ class GSWrapper(nn.Module):
             out_dim = self.order * self.steps
             if self.c_parametrization == "film_mlp_diff":
                 hidden_dim = int(getattr(self.solver_config, "c_film_hidden_dim", 256))
-                self.c_diff_model = PromptNoiseFiLMMlp(out_dim=out_dim, hidden_dim=hidden_dim)
+                self.c_diff_model = PromptNoiseFiLMMlp(
+                    out_dim=out_dim,
+                    hidden_dim=hidden_dim,
+                    in_channels=self.latent_channels,
+                )
             elif self.c_parametrization == "transformer":
                 c_cfg = getattr(config, "c_scheduler_model", None)
                 if c_cfg is None:
                     c_cfg = config.scheduler_model
-                self.c_diff_model = instantiate(c_cfg, num_timesteps=out_dim)
+                self.c_diff_model = self._instantiate_with_latent_channels(c_cfg, num_timesteps=out_dim)
             elif self.c_parametrization == "film_mlp":
                 c_cfg = getattr(config, "c_scheduler_model", None)
                 if c_cfg is None:
                     c_cfg = config.scheduler_model
-                self.c_diff_model = instantiate(c_cfg)
+                self.c_diff_model = self._instantiate_with_latent_channels(c_cfg)
             elif self.c_parametrization == "diff_transformer":
                 # ⭐ Новая параметризация: diff + transformer residual
                 c_cfg = getattr(config, "c_scheduler_model", None)
                 if c_cfg is None:
                     c_cfg = config.scheduler_model
-                self.c_diff_model = instantiate(c_cfg, num_timesteps=out_dim)
+                self.c_diff_model = self._instantiate_with_latent_channels(c_cfg, num_timesteps=out_dim)
             else:
                 raise ValueError(f"Unsupported c_parametrization={self.c_parametrization}")
             self._c_bias = nn.Parameter(
@@ -460,6 +474,17 @@ class GSWrapper(nn.Module):
 
     def unfreeze_mlp(self):
         self.enable_mlp()
+
+    def _instantiate_with_latent_channels(self, cfg, **kwargs):
+        """Hydra-instantiate scheduler; align noise encoder in_channels with latents."""
+        from omegaconf import OmegaConf
+
+        cfg_dict = OmegaConf.to_container(cfg, resolve=True)
+        if isinstance(cfg_dict, dict):
+            cfg_dict = dict(cfg_dict)
+            cfg_dict["in_channels"] = self.latent_channels
+            cfg = OmegaConf.create(cfg_dict)
+        return instantiate(cfg, **kwargs)
         
     def _get_shuffled_inputs_for_coefficients(
         self, 
