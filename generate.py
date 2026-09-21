@@ -82,6 +82,12 @@ def sample_manual_gs_params(
     cfg: DictConfig,
     seed: int,
 ) -> Dict[str, torch.Tensor]:
+    """Sample random GS coefficients for synthetic teacher generation.
+
+    Used when ``synthetic_gs_dataset.enabled`` is set: each sample gets its own
+    a*/c*/t_couple (and optionally timesteps) so the pickle can store
+    ``manual_solver_params.*`` for later GT comparison during student training.
+    """
     coef_std = float(getattr(cfg, "coef_std", 0.01))
     t_couple_std = float(getattr(cfg, "t_couple_std", coef_std))
     t_std = float(getattr(cfg, "t_std", coef_std))

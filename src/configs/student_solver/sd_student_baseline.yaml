@@ -3,10 +3,11 @@ order: 3
 t_eps: 0.001
 latent_channels: 4
 text_embed_dim: 768
-t_couple_parametrization: diff   # diff | film_mlp | prompt_noise_film_mlp
 
-t_parametrization: diff          # diff | transformer | film_mlp | prompt_noise_film_mlp
-a_parametrization: diff          # diff | transformer | film_mlp | film_mlp_diff | diff_transformer
+# Classic GAS baseline: learnable global a/c/t_couple diffs (no FiLM/transformer).
+t_couple_parametrization: diff
+t_parametrization: diff
+a_parametrization: diff
 c_parametrization: diff
 
 use_theory_coef: true

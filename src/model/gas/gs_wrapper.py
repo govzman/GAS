@@ -14,42 +14,8 @@ from src.model.gas.base_model import BaseModel
 from src.model.gas.generalized_solver import GeneralizedSolver
 from src.model.gas.adversarial_module.dist_adv_loss import DistAdversarialTraining
 from src.model.gas.synt_data import SyntDataType
-from src.model.gas.stepwise_coeff_predictor import StepwiseCoeffPredictor
 from src.scheduler_model.film_mlp import PromptNoiseFiLMMlp
 
-
-def _final_linear_scheduler_transformer(module: nn.Module) -> Optional[nn.Linear]:
-    """Последний `Linear` в голове `SchedulerTransformer`: `*.mlps.mlps[-1]` (вложенный MLP)."""
-    inner = getattr(module, "mlps", None)
-    if inner is None or not hasattr(inner, "mlps"):
-        return None
-    seq = inner.mlps
-    if not isinstance(seq, nn.Sequential) or len(seq) == 0:
-        return None
-    tail = seq[-1]
-    return tail if isinstance(tail, nn.Linear) else None
-
-
-def _init_scheduler_transformer_residual_head(
-    module: nn.Module,
-    logistic_bias_1d: Optional[torch.Tensor] = None,
-) -> None:
-    """
-    Вес последнего линейного слоя в нуль (остаток к теоретическим a/c или к нулевому сдвигу t);
-    bias — нули или заданный вектор логитов (inv stick-breaking для равномерной сетки t), если совпадает размерность.
-    """
-    lin = _final_linear_scheduler_transformer(module)
-    if lin is None:
-        return
-    nn.init.zeros_(lin.weight)
-    if lin.bias is None:
-        return
-    if logistic_bias_1d is not None and logistic_bias_1d.numel() == lin.bias.numel():
-        with torch.no_grad():
-            lin.bias.copy_(logistic_bias_1d.to(device=lin.bias.device, dtype=lin.bias.dtype))
-    else:
-        nn.init.zeros_(lin.bias)
-    
 
 class GSWrapper(nn.Module):
     """Generalised Solver wrapper. 
@@ -86,17 +52,6 @@ class GSWrapper(nn.Module):
         self.solver_config = config.student_solver
         self.t_eps = self.model.t_eps
         
-        self.shuffle_coef_noise = getattr(self.solver_config, "shuffle_coef_noise", False)
-        self.shuffle_coef_conditioning = getattr(self.solver_config, "shuffle_coef_conditioning", False)
-
-        # Backward compatibility
-        if getattr(self.solver_config, "shuffle_conditioning", False):
-            self.shuffle_coef_noise = True
-            self.shuffle_coef_conditioning = True
-
-        if self.shuffle_coef_noise or self.shuffle_coef_conditioning:
-            print(f"⚠️ WARNING: Coefficient shuffle enabled - noise: {self.shuffle_coef_noise}, conditioning: {self.shuffle_coef_conditioning}")
-        
         # create lpips
         self.loss_fn_vgg = lpips.LPIPS(net='vgg').requires_grad_(False)
         self.loss_fn_vgg.eval()
@@ -104,41 +59,10 @@ class GSWrapper(nn.Module):
         # construct loss
         self.loss_config = config.loss_config
 
-        # REPA (Representation Alignment, frozen DINOv2)
-        self.use_repa = getattr(self.loss_config, "use_repa", False)
-        self.use_repa_in_eval = getattr(self.loss_config, "use_repa_in_eval", False)
-        self.repa_loss = None
-        if self.use_repa:
-            from src.model.gas.repa_loss import FinalREPALoss
-
-            self.repa_loss = FinalREPALoss(
-                model_name=getattr(self.loss_config, "repa_model", "dinov2_vitb14"),
-                layer_indices=getattr(self.loss_config, "repa_layer_indices", None),
-                loss_type=getattr(self.loss_config, "repa_loss_type", "cosine"),
-                layer_weights=getattr(self.loss_config, "repa_layer_weights", None),
-                use_cls_token=getattr(self.loss_config, "repa_use_cls_token", True),
-                use_patch_tokens=getattr(self.loss_config, "repa_use_patch_tokens", True),
-                normalize_features=getattr(self.loss_config, "repa_normalize_features", True),
-                pretrained=getattr(self.loss_config, "repa_pretrained", True),
-            )
-            self.repa_loss.eval()
-
         assert self.loss_config.loss_type in ["GS", "GAS"]
         if self.loss_config.loss_type == "GAS":
             self.adv_loss = DistAdversarialTraining(self.loss_config)
         
-        self.freeze_mlp_steps = int(getattr(self.solver_config, 'freeze_mlp_steps', 0))
-        self.mlp_disabled = (self.freeze_mlp_steps > 0)  # ⭐ Новый флаг вместо mlp_frozen
-
-        if self.freeze_mlp_steps > 0:
-            print(f"🧊 MLP will be DISABLED (not frozen) for first {self.freeze_mlp_steps} steps")
-
-        self.use_stepwise_coeff = bool(getattr(self.solver_config, "use_stepwise_coeff", False))
-        self.stepwise_predictor: Optional[StepwiseCoeffPredictor] = None
-        self._stepwise_coeff_buffers: Optional[Dict[str, torch.Tensor]] = None
-        self._stepwise_sampling_timesteps: Optional[torch.Tensor] = None
-        self._stepwise_live_coeffs: Dict[str, torch.Tensor] = {}
-        self._stepwise_vis_trace: Optional[Dict[str, List[float]]] = None
         self._retain_solver_coeff_grads: bool = False
 
         # setup solver
@@ -157,11 +81,12 @@ class GSWrapper(nn.Module):
             getattr(self.solver_config, "t_schedule_parametrization", "diff"),
         )
 
+        # Timestep logits: static diff, FiLM(noise, prompt), or transformer.
         if self.t_parametrization in ("diff", "mu_logit"):
             self.mu_logit = nn.Parameter(torch.ones(self.steps - 1), requires_grad=self.solver_config.t_requires_grad)
             t_unif = torch.linspace(1., self.t_eps, self.steps + 1).flip(0)
             self.mu_logit.data = self.get_inv_t_steps(t_unif)
-        elif self.t_parametrization in ("film_mlp", "prompt_noise_film_mlp"):
+        elif self.t_parametrization == "film_mlp":
             hidden_dim = int(getattr(self.solver_config, "t_film_hidden_dim", 256))
             self.mu_logit = PromptNoiseFiLMMlp(
                 out_dim=self.steps - 1,
@@ -175,57 +100,6 @@ class GSWrapper(nn.Module):
 
         solver.get_time_steps = lambda *args, **kwargs: self.get_t_steps(*args, **kwargs)
 
-        self.use_shared_ac_backbone = getattr(self.solver_config, "use_shared_ac_backbone", False)
-        if self.use_stepwise_coeff:
-            stepwise_cfg = getattr(self.solver_config, "stepwise_predictor", None)
-            if stepwise_cfg is not None:
-                stepwise_cfg = dict(stepwise_cfg)
-                stepwise_cfg.setdefault("order", self.order)
-                stepwise_cfg.setdefault("latent_channels", self.latent_channels)
-                stepwise_cfg.setdefault("text_embed_dim", self.text_embed_dim)
-                self.stepwise_predictor = instantiate(stepwise_cfg)
-            else:
-                self.stepwise_predictor = StepwiseCoeffPredictor(
-                    order=self.order,
-                    latent_channels=self.latent_channels,
-                    text_embed_dim=self.text_embed_dim,
-                    hidden_dim=int(getattr(self.solver_config, "stepwise_hidden_dim", 256)),
-                )
-            print("🔁 Stepwise coefficient prediction enabled")
-            if self.use_shared_ac_backbone:
-                print(
-                    "⚠️ use_stepwise_coeff=True: shared_ac_backbone is not used during sampling; "
-                    "stepwise_predictor drives per-step coefficients."
-                )
-        
-        if self.use_shared_ac_backbone:
-            # 1. Создаём noise encoder из конфига
-            noise_enc_cfg = self.solver_config.noise_encoder
-            if noise_enc_cfg is None:
-                raise ValueError("use_shared_ac_backbone=True, но не задан noise_encoder")
-            # Передаём in_channels, если конфиг это поддерживает
-            noise_enc_cfg = dict(noise_enc_cfg)  # копия, чтобы не мутировать исходный
-            if 'in_channels' not in noise_enc_cfg:
-                noise_enc_cfg['in_channels'] = self.latent_channels
-            noise_encoder = instantiate(noise_enc_cfg)
-
-            # 2. Создаём сам ac backbone (SharedPromptNoiseFiLMBackbone с головами)
-            ac_backbone_cfg = self.solver_config.ac_backbone
-            if ac_backbone_cfg is None:
-                raise ValueError("use_shared_ac_backbone=True, но не задан ac_backbone")
-            ac_backbone_cfg = dict(ac_backbone_cfg)
-            # Передаём размерности выходов a и c (order*steps)
-            ac_backbone_cfg['a_out_dim'] = self.order * self.steps
-            ac_backbone_cfg['c_out_dim'] = self.order * self.steps
-            # Передаём уже созданный noise_encoder, чтобы не создавать второй раз
-            ac_backbone_cfg['noise_encoder'] = noise_encoder
-            # prompt_dim и др. можно не передавать, если они зафиксированы в конфиге
-            self.shared_ac_backbone = instantiate(ac_backbone_cfg)
-
-            # Старые модели больше не нужны
-            self.a_diff_model = None
-            self.c_diff_model = None
-
         # init t_couple
         self.t_couple_parametrization = getattr(self.solver_config, "t_couple_parametrization", "diff")
         self.t_couple_model = None
@@ -234,7 +108,7 @@ class GSWrapper(nn.Module):
         if self.t_couple_parametrization == "diff":
             self.t_couple = nn.Parameter(torch.zeros(self.steps), requires_grad=self.solver_config.t_couple_requires_grad)
         else:
-            if self.t_couple_parametrization in ("film_mlp", "prompt_noise_film_mlp"):
+            if self.t_couple_parametrization == "film_mlp":
                 hidden_dim = int(getattr(self.solver_config, "t_couple_film_hidden_dim", 256))
                 self.t_couple_model = PromptNoiseFiLMMlp(
                     out_dim=self.steps,
@@ -250,112 +124,49 @@ class GSWrapper(nn.Module):
 
         solver.t_couple = self.t_couple
 
-        # init coef (a/c) parametrizations
+        # a/c: one network head predicts concatenated [a_flat | c_flat] (2 * order * steps),
+        # then slices become per-order coefficient tables (absolute prediction).
+        # Modes: diff | film_mlp | transformer
         self.a_parametrization = getattr(self.solver_config, "a_parametrization", "diff")
         self.c_parametrization = getattr(self.solver_config, "c_parametrization", "diff")
-        self.a_diff_model = None
-        self.c_diff_model = None
-        self._a_bias = None
-        self._c_bias = None
+        self._validate_ac_parametrization(self.a_parametrization, "a_parametrization")
+        self._validate_ac_parametrization(self.c_parametrization, "c_parametrization")
+        self.ac_coeff_model = None
+        self._ac_bias = None
+        self._ac_half_dim = self.order * self.steps
 
-        if self.a_parametrization != "diff":
-            out_dim = self.order * self.steps
-            if self.a_parametrization == "film_mlp_diff":
-                hidden_dim = int(getattr(self.solver_config, "a_film_hidden_dim", 256))
-                self.a_diff_model = PromptNoiseFiLMMlp(
-                    out_dim=out_dim,
-                    hidden_dim=hidden_dim,
-                    in_channels=self.latent_channels,
-                )
-            elif self.a_parametrization == "transformer":
-                a_cfg = getattr(config, "a_scheduler_model", None)
-                if a_cfg is None:
-                    a_cfg = config.scheduler_model
-                self.a_diff_model = self._instantiate_with_latent_channels(a_cfg, num_timesteps=out_dim)
-            elif self.a_parametrization == "film_mlp":
-                a_cfg = getattr(config, "a_scheduler_model", None)
-                if a_cfg is None:
-                    a_cfg = config.scheduler_model
-                self.a_diff_model = self._instantiate_with_latent_channels(a_cfg)
-            elif self.a_parametrization == "diff_transformer":
-                # ⭐ Новая параметризация: diff + transformer residual
-                a_cfg = getattr(config, "a_scheduler_model", None)
-                if a_cfg is None:
-                    a_cfg = config.scheduler_model
-                self.a_diff_model = self._instantiate_with_latent_channels(a_cfg, num_timesteps=out_dim)
-            else:
-                raise ValueError(f"Unsupported a_parametrization={self.a_parametrization}")
-            self._a_bias = nn.Parameter(
-                torch.zeros(self.order, self.steps),
-                requires_grad=self.solver_config.a_requires_grad,
-            )
+        self._init_ac_coeff_model(config)
 
-        if self.c_parametrization != "diff":
-            out_dim = self.order * self.steps
-            if self.c_parametrization == "film_mlp_diff":
-                hidden_dim = int(getattr(self.solver_config, "c_film_hidden_dim", 256))
-                self.c_diff_model = PromptNoiseFiLMMlp(
-                    out_dim=out_dim,
-                    hidden_dim=hidden_dim,
-                    in_channels=self.latent_channels,
-                )
-            elif self.c_parametrization == "transformer":
-                c_cfg = getattr(config, "c_scheduler_model", None)
-                if c_cfg is None:
-                    c_cfg = config.scheduler_model
-                self.c_diff_model = self._instantiate_with_latent_channels(c_cfg, num_timesteps=out_dim)
-            elif self.c_parametrization == "film_mlp":
-                c_cfg = getattr(config, "c_scheduler_model", None)
-                if c_cfg is None:
-                    c_cfg = config.scheduler_model
-                self.c_diff_model = self._instantiate_with_latent_channels(c_cfg)
-            elif self.c_parametrization == "diff_transformer":
-                # ⭐ Новая параметризация: diff + transformer residual
-                c_cfg = getattr(config, "c_scheduler_model", None)
-                if c_cfg is None:
-                    c_cfg = config.scheduler_model
-                self.c_diff_model = self._instantiate_with_latent_channels(c_cfg, num_timesteps=out_dim)
-            else:
-                raise ValueError(f"Unsupported c_parametrization={self.c_parametrization}")
-            self._c_bias = nn.Parameter(
-                torch.zeros(self.order, self.steps),
-                requires_grad=self.solver_config.c_requires_grad,
-            )
-
-        # baseline coefficients (current behavior)
-        # ====== A coefficients ======
-        if self.a_parametrization in ("diff", "film_mlp_diff", "diff_transformer"):
+        # Learnable global coeffs only for pure diff mode.
+        if self.a_parametrization == "diff":
             for i in range(1, self.order + 1):
-                aname = f'a{i}_diff'
+                aname = f"a{i}_diff"
                 self.register_parameter(
                     name=aname,
                     param=nn.Parameter(
                         torch.zeros(self.steps),
-                        requires_grad=self.solver_config.a_requires_grad
-                    )
+                        requires_grad=self.solver_config.a_requires_grad,
+                    ),
                 )
                 solver.__setattr__(aname, self.__getattr__(aname))
         else:
-            # placeholder, будет заменён батчевыми coeffs
             for i in range(1, self.order + 1):
-                solver.__setattr__(f'a{i}_diff', torch.zeros(self.steps))
+                solver.__setattr__(f"a{i}_diff", torch.zeros(self.steps))
 
-
-        # ====== C coefficients ======
-        if self.c_parametrization in ("diff", "film_mlp_diff", "diff_transformer"):
+        if self.c_parametrization == "diff":
             for i in range(1, self.order + 1):
-                cname = f'c{i}_diff'
+                cname = f"c{i}_diff"
                 self.register_parameter(
                     name=cname,
                     param=nn.Parameter(
                         torch.zeros(self.steps),
-                        requires_grad=self.solver_config.c_requires_grad
-                    )
+                        requires_grad=self.solver_config.c_requires_grad,
+                    ),
                 )
                 solver.__setattr__(cname, self.__getattr__(cname))
         else:
             for i in range(1, self.order + 1):
-                solver.__setattr__(f'c{i}_diff', torch.zeros(self.steps))
+                solver.__setattr__(f"c{i}_diff", torch.zeros(self.steps))
 
         # theory coef
         solver.use_theory_coef = self.solver_config.use_theory_coef
@@ -363,12 +174,8 @@ class GSWrapper(nn.Module):
             solver.init_coefs(
                 steps=self.steps,
                 order=self.order,
-                timesteps=self.get_t_steps()
+                timesteps=self.get_t_steps(),
             )
-        
-        # ==========================================
-        # Apply requires_grad flags consistently
-        # ==========================================
 
         def set_requires_grad(module, flag: bool):
             if module is None:
@@ -376,153 +183,117 @@ class GSWrapper(nn.Module):
             for p in module.parameters():
                 p.requires_grad = flag
 
-        # ---- A parameters ----
-        if self.a_parametrization in ("diff", "film_mlp_diff"):
-            # diff params already created with requires_grad flag
-            pass
-        else:
-            # control conditional model
-            set_requires_grad(self.a_diff_model, self.solver_config.a_requires_grad)
-            if self._a_bias is not None:
-                self._a_bias.requires_grad = self.solver_config.a_requires_grad
+        if self.ac_coeff_model is not None:
+            ac_grad = bool(getattr(self.solver_config, "a_requires_grad", True)) or bool(
+                getattr(self.solver_config, "c_requires_grad", True)
+            )
+            set_requires_grad(self.ac_coeff_model, ac_grad)
+            if self._ac_bias is not None:
+                self._ac_bias.requires_grad = ac_grad
 
-
-        # ---- C parameters ----
-        if self.c_parametrization in ("diff", "film_mlp_diff"):
-            pass
-        else:
-            set_requires_grad(self.c_diff_model, self.solver_config.c_requires_grad)
-            if self._c_bias is not None:
-                self._c_bias.requires_grad = self.solver_config.c_requires_grad
-
-        if self.stepwise_predictor is not None:
-            a_grad = bool(getattr(self.solver_config, "a_requires_grad", True))
-            c_grad = bool(getattr(self.solver_config, "c_requires_grad", True))
-            set_requires_grad(self.stepwise_predictor, a_grad or c_grad)
-
-        # ---- t_couple parameters ----
-        if self.t_couple_parametrization == "diff":
-            pass
-        else:
+        if self.t_couple_parametrization != "diff":
             set_requires_grad(self.t_couple_model, self.solver_config.t_couple_requires_grad)
             if self._t_couple_bias is not None:
                 self._t_couple_bias.requires_grad = self.solver_config.t_couple_requires_grad
-            
-        # ==========================================
-        # Residual initialization for conditional a/c
-        # ==========================================
 
-        def zero_last_layer(module):
-            if _final_linear_scheduler_transformer(module) is not None:
-                _init_scheduler_transformer_residual_head(module)
-                return
-            if isinstance(module, nn.Sequential):
-                last = module[-1]
-                if isinstance(last, nn.Linear):
-                    nn.init.zeros_(last.weight)
-                    if last.bias is not None:
-                        nn.init.zeros_(last.bias)
-            elif isinstance(module, nn.Linear):
-                nn.init.zeros_(module.weight)
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
-
-        # A model
-        if self.a_diff_model is not None:
-            if self.a_parametrization == "diff_transformer":
-                # ⭐ Для transformer используем специальную инициализацию
-                if hasattr(config, "a_scheduler_model"):
-                    t_unif = torch.linspace(1.0, self.t_eps, self.steps + 1).flip(0)
-                    # Создаём фейковые логиты для transformer (он ожидает другой формат)
-                    # Трансформер будет предсказывать residual, начиная с нуля
-                    _init_scheduler_transformer_residual_head(self.a_diff_model)
-                else:
-                    zero_last_layer(self.a_diff_model)
-            else:
-                zero_last_layer(self.a_diff_model)
-
-        # C model
-        if self.c_diff_model is not None:
-            if self.c_parametrization == "diff_transformer":
-                # ⭐ Для transformer используем специальную инициализацию
-                if hasattr(config, "c_scheduler_model"):
-                    _init_scheduler_transformer_residual_head(self.c_diff_model)
-                else:
-                    zero_last_layer(self.c_diff_model)
-            else:
-                zero_last_layer(self.c_diff_model)
-
-        # Расписание t: inv stick-breaking для равномерной сетки
-        if self.t_parametrization == "transformer":
-            t_unif = torch.linspace(1.0, self.t_eps, self.steps + 1).flip(0)
-            inv_logits = self.get_inv_t_steps(t_unif)
-            _init_scheduler_transformer_residual_head(self.mu_logit, logistic_bias_1d=inv_logits)
-        
-        # end init solver
         self.solver = solver
-        
-    def disable_mlp(self):
-        """Отключает MLP-добавку (используются только базовые diff параметры)."""
-        self.mlp_disabled = True
 
-    def enable_mlp(self):
-        """Включает MLP-добавку."""
-        self.mlp_disabled = False
+    @staticmethod
+    def _validate_ac_parametrization(mode: str, name: str) -> None:
+        allowed = {"diff", "film_mlp", "transformer"}
+        if mode not in allowed:
+            raise ValueError(
+                f"Unsupported {name}={mode}. Allowed: {sorted(allowed)}"
+            )
 
-    # Для обратной совместимости с training.py (если там вызывается freeze_mlp/unfreeze_mlp)
-    def freeze_mlp(self):
-        self.disable_mlp()
+    @staticmethod
+    def _ac_mode_needs_network(mode: str) -> bool:
+        return mode not in ("diff",)
 
-    def unfreeze_mlp(self):
-        self.enable_mlp()
+    @staticmethod
+    def _ac_network_family(mode: str) -> Optional[str]:
+        if mode == "film_mlp":
+            return "film"
+        if mode == "transformer":
+            return "transformer"
+        return None
+
+    def _init_ac_coeff_model(self, config: ConfigDict) -> None:
+        """Build one FiLM/transformer head that outputs [a_flat | c_flat]."""
+        a_needs = self._ac_mode_needs_network(self.a_parametrization)
+        c_needs = self._ac_mode_needs_network(self.c_parametrization)
+        if not a_needs and not c_needs:
+            return
+
+        families = {
+            f
+            for f in (
+                self._ac_network_family(self.a_parametrization),
+                self._ac_network_family(self.c_parametrization),
+            )
+            if f is not None
+        }
+        if len(families) > 1:
+            raise ValueError(
+                f"a_parametrization={self.a_parametrization} and "
+                f"c_parametrization={self.c_parametrization} need different network "
+                f"families {families}; use one head type for both."
+            )
+        family = next(iter(families))
+        out_dim = 2 * self._ac_half_dim
+
+        if family == "film":
+            hidden_dim = int(
+                getattr(
+                    self.solver_config,
+                    "ac_film_hidden_dim",
+                    getattr(
+                        self.solver_config,
+                        "a_film_hidden_dim",
+                        getattr(self.solver_config, "c_film_hidden_dim", 256),
+                    ),
+                )
+            )
+            self.ac_coeff_model = PromptNoiseFiLMMlp(
+                out_dim=out_dim,
+                hidden_dim=hidden_dim,
+                in_channels=self.latent_channels,
+            )
+        else:
+            ac_cfg = getattr(config, "ac_scheduler_model", None)
+            if ac_cfg is None:
+                ac_cfg = getattr(config, "a_scheduler_model", None)
+            if ac_cfg is None:
+                ac_cfg = getattr(config, "c_scheduler_model", None)
+            if ac_cfg is None:
+                ac_cfg = config.scheduler_model
+            self.ac_coeff_model = self._instantiate_with_latent_channels(
+                ac_cfg, num_timesteps=out_dim
+            )
+
+        self._ac_bias = nn.Parameter(torch.zeros(out_dim), requires_grad=True)
 
     def _instantiate_with_latent_channels(self, cfg, **kwargs):
-        """Hydra-instantiate scheduler; align noise encoder in_channels with latents."""
+        """Hydra-instantiate a scheduler model.
+
+        FiLM configs need ``in_channels`` aligned with latents; transformer uses its
+        own ImageEncoder and must not receive that kwarg.
+        """
         from omegaconf import OmegaConf
 
         cfg_dict = OmegaConf.to_container(cfg, resolve=True)
         if isinstance(cfg_dict, dict):
             cfg_dict = dict(cfg_dict)
-            cfg_dict["in_channels"] = self.latent_channels
+            target = str(cfg_dict.get("_target_", ""))
+            if "PromptNoiseFiLMMlp" in target:
+                cfg_dict["in_channels"] = self.latent_channels
+            else:
+                cfg_dict.pop("in_channels", None)
             cfg = OmegaConf.create(cfg_dict)
         return instantiate(cfg, **kwargs)
-        
-    def _get_shuffled_inputs_for_coefficients(
-        self, 
-        x_t: torch.Tensor, 
-        cond_emb: Optional[torch.Tensor]
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """
-        Create shuffled inputs ONLY for coefficient prediction.
-        Does NOT affect the denoiser.
-        """
-        if not (self.shuffle_coef_noise or self.shuffle_coef_conditioning):
-            return x_t, cond_emb
-
-        B = x_t.shape[0]
-        shuffled_x_t = x_t
-        shuffled_cond_emb = cond_emb
-
-        if self.shuffle_coef_noise:
-            noise_perm = torch.randperm(B, device=x_t.device)
-            shuffled_x_t = x_t[noise_perm]
-
-        if self.shuffle_coef_conditioning and cond_emb is not None:
-            cond_perm = torch.randperm(B, device=cond_emb.device)
-            shuffled_cond_emb = cond_emb[cond_perm]
-
-        return shuffled_x_t, shuffled_cond_emb
-
-    def _clear_stepwise_sampling_state(self) -> None:
-        self._stepwise_coeff_buffers = None
-        self._stepwise_sampling_timesteps = None
-        self._stepwise_base_coeffs = None
-        self._stepwise_live_coeffs = {}
 
     def should_log_final_solver_coeffs(self) -> bool:
         """True when effective coeffs live on the solver (not only static diff Parameters)."""
-        if self.use_stepwise_coeff:
-            return True
         if self.a_parametrization != "diff" or self.c_parametrization != "diff":
             return True
         if self.t_couple_parametrization != "diff":
@@ -531,14 +302,6 @@ class GSWrapper(nn.Module):
 
     def set_retain_solver_coeff_grads(self, enabled: bool) -> None:
         self._retain_solver_coeff_grads = bool(enabled)
-
-    def enable_stepwise_vis_trace(self, enabled: bool) -> None:
-        self._stepwise_vis_trace = {} if enabled else None
-
-    def consume_stepwise_vis_trace(self) -> Optional[Dict[str, List[float]]]:
-        trace = self._stepwise_vis_trace
-        self._stepwise_vis_trace = None
-        return trace
 
     def _retain_solver_coeff_if_needed(self, tensor: torch.Tensor) -> torch.Tensor:
         if self._retain_solver_coeff_grads and tensor.requires_grad:
@@ -595,188 +358,6 @@ class GSWrapper(nn.Module):
                 out[name] = self._reduce_coeff_tensor_for_logging(tensor.grad, reduction=reduction)
         return out
 
-    def _record_stepwise_vis_trace(self, step_idx: int, buffers: Dict[str, torch.Tensor]) -> None:
-        if self._stepwise_vis_trace is None or not buffers:
-            return
-        ref = next(iter(buffers.values()))
-        for name, buf in buffers.items():
-            if not isinstance(buf, torch.Tensor):
-                continue
-            if buf.ndim == 2:
-                col = min(step_idx, buf.shape[1] - 1)
-                val = buf[:, col].detach().float().mean().item()
-            elif buf.ndim == 1:
-                col = min(step_idx, buf.shape[0] - 1)
-                val = buf[col].detach().float().item()
-            else:
-                val = buf.detach().float().mean().item()
-            self._stepwise_vis_trace.setdefault(name, []).append(val)
-        t_current = self._get_step_time(
-            step_idx,
-            batch_size=ref.shape[0],
-            device=ref.device,
-            dtype=ref.dtype,
-        )
-        self._stepwise_vis_trace.setdefault("t_current", []).append(
-            float(t_current.detach().float().mean().item())
-        )
-
-    def _a_has_diff_baseline(self) -> bool:
-        return self.a_parametrization in ("diff", "film_mlp_diff", "diff_transformer")
-
-    def _c_has_diff_baseline(self) -> bool:
-        return self.c_parametrization in ("diff", "film_mlp_diff", "diff_transformer")
-
-    def _get_stepwise_base_coeff_matrix(
-        self,
-        name: str,
-        *,
-        has_diff_baseline: bool,
-        batch_size: int,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> torch.Tensor:
-        """Build (B, steps) baseline table for stepwise sampling."""
-        if has_diff_baseline:
-            base = getattr(self, name)  # (steps,)
-            return base.unsqueeze(0).expand(batch_size, -1).to(device=device, dtype=dtype)
-
-        solver_val = getattr(self.solver, name, None)
-        if isinstance(solver_val, torch.Tensor):
-            if solver_val.ndim == 2:
-                if solver_val.shape[0] == batch_size:
-                    return solver_val.to(device=device, dtype=dtype)
-                if solver_val.shape[0] == 1:
-                    return solver_val.expand(batch_size, -1).to(device=device, dtype=dtype)
-            if solver_val.ndim == 1:
-                return solver_val.unsqueeze(0).expand(batch_size, -1).to(device=device, dtype=dtype)
-
-        return torch.zeros(batch_size, self.steps, device=device, dtype=dtype)
-
-    def _build_stepwise_base_coeffs(
-        self,
-        batch_size: int,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> Dict[str, torch.Tensor]:
-        bases: Dict[str, torch.Tensor] = {}
-        for i in range(1, self.order + 1):
-            bases[f"a{i}_diff"] = self._get_stepwise_base_coeff_matrix(
-                f"a{i}_diff",
-                has_diff_baseline=self._a_has_diff_baseline(),
-                batch_size=batch_size,
-                device=device,
-                dtype=dtype,
-            )
-            bases[f"c{i}_diff"] = self._get_stepwise_base_coeff_matrix(
-                f"c{i}_diff",
-                has_diff_baseline=self._c_has_diff_baseline(),
-                batch_size=batch_size,
-                device=device,
-                dtype=dtype,
-            )
-        return bases
-
-    def _init_coeff_buffers(self, batch_size: int, device: torch.device, dtype: torch.dtype) -> None:
-        """Allocate (B, steps) coefficient tables for stepwise sampling."""
-        self._stepwise_coeff_buffers = self._build_stepwise_base_coeffs(
-            batch_size, device, dtype
-        )
-        self._assign_stepwise_buffers_to_solver()
-
-    def _assign_stepwise_buffers_to_solver(self) -> None:
-        if self._stepwise_coeff_buffers is None:
-            return
-        for name, buf in self._stepwise_coeff_buffers.items():
-            self._attach_solver_coeff(name, buf)
-
-    def _get_step_time(
-        self,
-        step_idx: int,
-        batch_size: int,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> torch.Tensor:
-        timesteps = self._stepwise_sampling_timesteps
-        if timesteps is None:
-            return torch.zeros(batch_size, device=device, dtype=dtype)
-        target_idx = step_idx + 1  # шаг, для которого предсказываем
-        if timesteps.ndim == 2:
-            if target_idx >= timesteps.shape[1]:
-                target_idx = timesteps.shape[1] - 1
-            return timesteps[:, target_idx].to(device=device, dtype=dtype)
-        else:
-            if target_idx >= timesteps.shape[0]:
-                target_idx = timesteps.shape[0] - 1
-            return timesteps[target_idx].expand(batch_size).to(device=device, dtype=dtype)
-
-    def _get_base_coeff_at_step(
-        self,
-        name: str,
-        step_idx: int,
-        batch_size: int,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> torch.Tensor:
-        """Возвращает базовый коэффициент для конкретного шага как (B,) тензор."""
-        if self._a_has_diff_baseline() and name.startswith("a"):
-            param = getattr(self, name)          # nn.Parameter (steps,)
-            val = param[step_idx]                # скаляр с градиентом
-            return val.expand(batch_size).to(device=device, dtype=dtype)
-        if self._c_has_diff_baseline() and name.startswith("c"):
-            param = getattr(self, name)
-            val = param[step_idx]
-            return val.expand(batch_size).to(device=device, dtype=dtype)
-        # Иначе — берём из solver (там уже лежит (B, steps) без clone)
-        solver_val = getattr(self.solver, name, None)
-        if isinstance(solver_val, torch.Tensor):
-            if solver_val.ndim == 2:
-                return solver_val[:, step_idx].to(device=device, dtype=dtype)
-            if solver_val.ndim == 1:
-                return solver_val[step_idx].expand(batch_size).to(device=device, dtype=dtype)
-        return torch.zeros(batch_size, device=device, dtype=dtype)
-
-    def _update_stepwise_coeffs(
-        self,
-        step_idx: int,
-        x_t: torch.Tensor,
-        cond_emb: Optional[torch.Tensor],
-    ) -> None:
-        """
-        Предсказываем коэффициенты для шага step_idx и кладём их в
-        self._stepwise_live_coeffs — dict {name: (B,) tensor}.
-        solver._get_step_param читает оттуда, если там что-то есть.
-        """
-        # На шаге 0 сбрасываем live-буфер
-        if step_idx == 0:
-            self._stepwise_live_coeffs: Dict[str, torch.Tensor] = {}
-            return
-
-        if self.mlp_disabled or self.stepwise_predictor is None:
-            self._stepwise_live_coeffs = {}
-            return
-
-        shuffled_x, shuffled_cond = self._get_shuffled_inputs_for_coefficients(x_t, cond_emb)
-        if shuffled_cond is None:
-            self._stepwise_live_coeffs = {}
-            return
-
-        batch_size, device, dtype = x_t.shape[0], x_t.device, x_t.dtype
-        t_current = self._get_step_time(step_idx, batch_size, device, dtype)
-
-        # a_pred/c_pred: (B, order) — delta поверх базовых коэффициентов
-        a_pred, c_pred = self.stepwise_predictor(shuffled_x, t_current, shuffled_cond)
-
-        live: Dict[str, torch.Tensor] = {}
-        for i in range(1, self.order + 1):
-            # Базовый коэффициент для этого шага — скаляр или (B,)
-            base_a = self._get_base_coeff_at_step(f"a{i}_diff", step_idx, batch_size, device, dtype)
-            base_c = self._get_base_coeff_at_step(f"c{i}_diff", step_idx, batch_size, device, dtype)
-            live[f"a{i}_diff"] = base_a + a_pred[:, i - 1]   # (B,)
-            live[f"c{i}_diff"] = base_c + c_pred[:, i - 1]   # (B,)
-
-        self._stepwise_live_coeffs = live
-
     def _update_dynamic_t_couple(
         self,
         noise: torch.Tensor,
@@ -785,12 +366,38 @@ class GSWrapper(nn.Module):
         if self.t_couple_parametrization == "diff":
             return
 
-        shuffled_noise, shuffled_cond_emb = self._get_shuffled_inputs_for_coefficients(noise, cond_emb)
-        if shuffled_cond_emb is not None:
-            t_couple = self.t_couple_model(shuffled_noise, shuffled_cond_emb)
+        if cond_emb is not None:
+            t_couple = self.t_couple_model(noise, cond_emb)
         else:
             t_couple = self._t_couple_bias.reshape(1, self.steps)
         self._attach_solver_coeff("t_couple", t_couple)
+
+    def _predict_ac_flat(
+        self,
+        noise: torch.Tensor,
+        cond_emb: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Run the single a/c head and split into a_flat, c_flat (each order*steps)."""
+        half = self._ac_half_dim
+        if cond_emb is not None:
+            flat = self.ac_coeff_model(noise, cond_emb)
+        else:
+            flat = self._ac_bias.reshape(1, -1).expand(noise.shape[0], -1)
+        return flat[:, :half], flat[:, half:]
+
+    def _attach_ac_side(
+        self,
+        prefix: str,
+        parametrization: str,
+        pred_flat: torch.Tensor,
+    ) -> None:
+        """Attach a* or c* tables from a flat (B, order*steps) prediction."""
+        if parametrization == "diff":
+            return
+
+        tables = pred_flat.reshape(pred_flat.shape[0], self.order, self.steps)
+        for i in range(1, self.order + 1):
+            self._attach_solver_coeff(f"{prefix}{i}_diff", tables[:, i - 1, :])
 
     def _update_dynamic_ac_coefs(
         self,
@@ -798,183 +405,25 @@ class GSWrapper(nn.Module):
         cond_emb: Optional[torch.Tensor],
     ) -> None:
         """
-        If enabled by config, compute batch-dependent a/c coefficient tables and
-        attach them to the solver as tensors of shape (B, steps).
+        Predict batch-dependent a/c coefficient tables with one head and attach
+        them to the solver as tensors of shape (B, steps).
+
+        Output layout: [a_flat | c_flat], each of length order * steps.
+        Pure ``diff`` sides keep their registered parameters unchanged.
         """
-        # ---- SHARED BACKBONE ----
-        if self.use_shared_ac_backbone:
-            if self.mlp_disabled:
-                # Только базовые параметры (diff)
-                if self.a_parametrization in ("film_mlp_diff", "diff_transformer"):
-                    base_a = torch.stack([getattr(self, f'a{i}_diff') for i in range(1, self.order+1)], dim=0)
-                    a_all = base_a.unsqueeze(0).expand(noise.shape[0], -1, -1)
-                else:
-                    a_all = self._a_bias.unsqueeze(0).expand(noise.shape[0], -1, -1)
-                for i in range(1, self.order+1):
-                    self._attach_solver_coeff(f"a{i}_diff", a_all[:, i-1, :])
-
-                if self.c_parametrization in ("film_mlp_diff", "diff_transformer"):
-                    base_c = torch.stack([getattr(self, f'c{i}_diff') for i in range(1, self.order+1)], dim=0)
-                    c_all = base_c.unsqueeze(0).expand(noise.shape[0], -1, -1)
-                else:
-                    c_all = self._c_bias.unsqueeze(0).expand(noise.shape[0], -1, -1)
-                for i in range(1, self.order+1):
-                    self._attach_solver_coeff(f"c{i}_diff", c_all[:, i-1, :])
-                return
-
-            # Активный режим
-            if cond_emb is not None:
-                shuffled_noise, shuffled_cond_emb = self._get_shuffled_inputs_for_coefficients(noise, cond_emb)
-                a_flat, c_flat = self.shared_ac_backbone(shuffled_noise, shuffled_cond_emb)
-            else:
-                a_flat = self._a_bias.reshape(1, -1).expand(noise.shape[0], -1)
-                c_flat = self._c_bias.reshape(1, -1).expand(noise.shape[0], -1)
-
-            # Применяем a
-            if self.a_parametrization in ("film_mlp_diff", "diff_transformer"):
-                base_a = torch.stack([getattr(self, f'a{i}_diff') for i in range(1, self.order+1)], dim=0)
-                a_all = base_a.unsqueeze(0) + a_flat.reshape(-1, self.order, self.steps)
-            else:
-                a_all = a_flat.reshape(noise.shape[0], self.order, self.steps)
-            for i in range(1, self.order+1):
-                self._attach_solver_coeff(f"a{i}_diff", a_all[:, i-1, :])
-
-            # Применяем c
-            if self.c_parametrization in ("film_mlp_diff", "diff_transformer"):
-                base_c = torch.stack([getattr(self, f'c{i}_diff') for i in range(1, self.order+1)], dim=0)
-                c_all = base_c.unsqueeze(0) + c_flat.reshape(-1, self.order, self.steps)
-            else:
-                c_all = c_flat.reshape(noise.shape[0], self.order, self.steps)
-            for i in range(1, self.order+1):
-                self._attach_solver_coeff(f"c{i}_diff", c_all[:, i-1, :])
+        if self.ac_coeff_model is None:
             return
-        
-        if self.a_parametrization not in ("diff", "film_mlp_diff", "diff_transformer"):
-            out_dim = self.order * self.steps
-            if self.a_parametrization in ("film_mlp", "prompt_noise_film_mlp"):
-                shuffled_noise, shuffled_cond_emb = self._get_shuffled_inputs_for_coefficients(noise, cond_emb)
-                if shuffled_cond_emb is not None:
-                    a_flat = self.a_diff_model(shuffled_noise, shuffled_cond_emb)
-                else:
-                    a_flat = self._a_bias.reshape(1, out_dim)
-            else:  # transformer
-                if cond_emb is not None:
-                    a_flat = self.a_diff_model(noise, cond_emb)  # (B, out_dim)
-                else:
-                    dev = noise.device
-                    dummy_cond = torch.zeros(1, 77, 768, device=dev)
-                    a_flat = self.a_diff_model(noise, dummy_cond)  # (1, out_dim)
-            a_all = a_flat.reshape(a_flat.shape[0], self.order, self.steps)
-            
-            for i in range(1, self.order + 1):
-                self._attach_solver_coeff(f"a{i}_diff", a_all[:, i - 1, :])
-        elif self.a_parametrization == "film_mlp_diff":
-            # ⭐ Режим diff + residual из MLP
-            base_a = torch.stack([getattr(self, f'a{i}_diff') for i in range(1, self.order+1)], dim=0)
 
-            # ⭐ КЛЮЧЕВОЕ ИЗМЕНЕНИЕ: проверяем mlp_disabled вместо mlp_frozen
-            if not self.mlp_disabled:
-                # MLP включен: base + mlp_residual
-                if cond_emb is not None:
-                    mlp_out = self.a_diff_model(noise, cond_emb)
-                else:
-                    mlp_out = self._a_bias.reshape(1, -1).expand(noise.shape[0], -1)
-                mlp_out = mlp_out.reshape(-1, self.order, self.steps)
-                a_all = base_a.unsqueeze(0) + mlp_out
-            else:
-                # ⭐ MLP отключен: используем только base_a (diff параметры)
-                # Градиенты всё равно текут через весь граф!
-                a_all = base_a.unsqueeze(0).expand(noise.shape[0], -1, -1)
-
-            for i in range(1, self.order+1):
-                self._attach_solver_coeff(f"a{i}_diff", a_all[:, i-1, :])
-        elif self.a_parametrization == "diff_transformer":
-            # ⭐ Режим diff + transformer residual
-            base_a = torch.stack([getattr(self, f'a{i}_diff') for i in range(1, self.order+1)], dim=0)
-
-            if not self.mlp_disabled:
-                # Transformer включен: base + transformer_residual
-                if cond_emb is not None:
-                    transformer_out = self.a_diff_model(noise, cond_emb)
-                else:
-                    dev = noise.device
-                    dummy_cond = torch.zeros(1, 77, 768, device=dev, dtype=noise.dtype)
-                    transformer_out = self.a_diff_model(noise, dummy_cond)
-                transformer_out = transformer_out.reshape(-1, self.order, self.steps)
-                a_all = base_a.unsqueeze(0) + transformer_out
-            else:
-                # ⭐ Transformer отключен: используем только base_a (diff параметры)
-                a_all = base_a.unsqueeze(0).expand(noise.shape[0], -1, -1)
-
-            for i in range(1, self.order+1):
-                self._attach_solver_coeff(f"a{i}_diff", a_all[:, i-1, :])
-        
-        if self.c_parametrization not in ("diff", "film_mlp_diff", "diff_transformer"):
-            out_dim = self.order * self.steps
-            if self.c_parametrization in ("film_mlp", "prompt_noise_film_mlp"):
-                shuffled_noise, shuffled_cond_emb = self._get_shuffled_inputs_for_coefficients(noise, cond_emb)
-                if shuffled_cond_emb is not None:
-                    c_flat = self.c_diff_model(shuffled_noise, shuffled_cond_emb)
-                else:
-                    c_flat = self._c_bias.reshape(1, out_dim)
-            else:  # transformer
-                if cond_emb is not None:
-                    c_flat = self.c_diff_model(noise, cond_emb)  # (B, out_dim)
-                else:
-                    dev = noise.device
-                    dummy_cond = torch.zeros(1, 77, 768, device=dev)
-                    c_flat = self.c_diff_model(noise, dummy_cond)  # (1, out_dim)
-            c_all = c_flat.reshape(c_flat.shape[0], self.order, self.steps)
-            
-            for i in range(1, self.order + 1):
-                self._attach_solver_coeff(f"c{i}_diff", c_all[:, i - 1, :])
-        elif self.c_parametrization == "film_mlp_diff":  # ⭐ ИСПРАВЛЕНО: было a_parametrization
-            # ⭐ Режим diff + residual из MLP
-            base_c = torch.stack([getattr(self, f'c{i}_diff') for i in range(1, self.order+1)], dim=0)
-
-            # ⭐ КЛЮЧЕВОЕ ИЗМЕНЕНИЕ: проверяем mlp_disabled вместо mlp_frozen
-            if not self.mlp_disabled:
-                # MLP включен: base + mlp_residual
-                if cond_emb is not None:
-                    mlp_out = self.c_diff_model(noise, cond_emb)
-                else:
-                    mlp_out = self._c_bias.reshape(1, -1).expand(noise.shape[0], -1)
-                mlp_out = mlp_out.reshape(-1, self.order, self.steps)
-                c_all = base_c.unsqueeze(0) + mlp_out
-            else:
-                # ⭐ MLP отключен: используем только base_c (diff параметры)
-                # Градиенты всё равно текут через весь граф!
-                c_all = base_c.unsqueeze(0).expand(noise.shape[0], -1, -1)
-
-            for i in range(1, self.order+1):
-                self._attach_solver_coeff(f"c{i}_diff", c_all[:, i-1, :])
-        elif self.c_parametrization == "diff_transformer":
-            # ⭐ Режим diff + transformer residual
-            base_c = torch.stack([getattr(self, f'c{i}_diff') for i in range(1, self.order+1)], dim=0)
-
-            if not self.mlp_disabled:
-                # Transformer включен: base + transformer_residual
-                if cond_emb is not None:
-                    transformer_out = self.c_diff_model(noise, cond_emb)
-                else:
-                    dev = noise.device
-                    dummy_cond = torch.zeros(1, 77, 768, device=dev, dtype=noise.dtype)
-                    transformer_out = self.c_diff_model(noise, dummy_cond)
-                transformer_out = transformer_out.reshape(-1, self.order, self.steps)
-                c_all = base_c.unsqueeze(0) + transformer_out
-            else:
-                # ⭐ Transformer отключен: используем только base_c (diff параметры)
-                c_all = base_c.unsqueeze(0).expand(noise.shape[0], -1, -1)
-
-            for i in range(1, self.order+1):
-                self._attach_solver_coeff(f"c{i}_diff", c_all[:, i-1, :])
+        a_flat, c_flat = self._predict_ac_flat(noise, cond_emb)
+        self._attach_ac_side("a", self.a_parametrization, a_flat)
+        self._attach_ac_side("c", self.c_parametrization, c_flat)
 
     # timesteps logic
     def get_t_steps(self, noise=None, cond_emb=None, **kwargs) -> torch.Tensor:
         """Get generation timesteps."""
         if self.t_parametrization in ("diff", "mu_logit"):
             logits = self.mu_logit
-        elif self.t_parametrization in ("film_mlp", "prompt_noise_film_mlp"):
+        elif self.t_parametrization == "film_mlp":
             if cond_emb is not None:
                 logits = self.mu_logit(noise, cond_emb)  # (B, steps-1)
             else:
@@ -1043,10 +492,6 @@ class GSWrapper(nn.Module):
         ema.load_state_dict(checkpoint['ema'])
         ema.copy_to(self.parameters())
 
-    # def parameters(self) -> List[nn.parameter.Parameter]:
-    #     """Returns list of specified solver and wrapper parameters."""
-    #     return list(p for p in super().parameters() if p.requires_grad)
-
     def interpolate_lpips(self, x: torch.Tensor) -> torch.Tensor:
         """Utility function to resize images for LPIPS calculation."""
         return interpolate(x, size=224, mode='bilinear').clip(-1., 1.)
@@ -1100,7 +545,10 @@ class GSWrapper(nn.Module):
         noise: torch.Tensor,
         cond_emb: Optional[torch.Tensor],
     ) -> None:
-        """Per-batch-element MSE/MAE vs teacher ``manual_solver_params`` when present."""
+        """Per-batch-element MSE/MAE vs teacher ``manual_solver_params`` when present.
+
+        Used on the synthetic dataset path where batch[4] carries teacher GT coeffs.
+        """
         if not gt_solver_params:
             return
         pred_all = self._predicted_gs_solver_tensors(noise, cond_emb)
@@ -1125,6 +573,7 @@ class GSWrapper(nn.Module):
     
     @contextlib.contextmanager
     def _manual_solver_params_context(self, manual_solver_params: Optional[dict]):
+        """Temporarily override solver coeffs/timesteps with teacher GT (synthetic data)."""
         if not manual_solver_params:
             yield
             return
@@ -1163,38 +612,15 @@ class GSWrapper(nn.Module):
         manual_solver_params = kwargs.pop("manual_solver_params", None)
             
         with self._manual_solver_params_context(manual_solver_params):
-            before_step_fn = None
             if manual_solver_params is None:
-                if self.use_stepwise_coeff:
-                    self._stepwise_sampling_timesteps = self.solver.get_time_steps(noise, cond_emb)
-                    self._stepwise_coeff_buffers = None
-                    self._update_dynamic_t_couple(noise=noise, cond_emb=cond_emb)
-                    self._update_dynamic_ac_coefs(noise=noise, cond_emb=cond_emb)
+                self._update_dynamic_t_couple(noise=noise, cond_emb=cond_emb)
+                self._update_dynamic_ac_coefs(noise=noise, cond_emb=cond_emb)
 
-                    def before_step_fn(step_idx: int, x: torch.Tensor) -> None:
-                        self._update_stepwise_coeffs(step_idx, x, cond_emb)
-                        # После обновления live-dict — пишем в solver только скалярные/батчевые
-                        # коэффициенты для текущего шага (не всю матрицу)
-                        live = getattr(self, "_stepwise_live_coeffs", {})
-                        for name, val in live.items():
-                            # val: (B,) — solver._get_step_param ожидает либо (steps,) либо (B, steps)
-                            # Передаём как (B, 1) и выставляем params_step=0, чтобы он брал [:, 0]
-                            self.solver.__setattr__(name, val.unsqueeze(1))   # (B, 1)
-                        if live:
-                            self.solver.params_step = 0   # _get_step_param возьмёт [:, 0]
-                else:
-                    self._update_dynamic_t_couple(noise=noise, cond_emb=cond_emb)
-                    self._update_dynamic_ac_coefs(noise=noise, cond_emb=cond_emb)
-
-            try:
-                images = self.solver.sample(
-                    x=noise,
-                    steps=self.steps,
-                    order=self.order,
-                    before_step_fn=before_step_fn,
-                )
-            finally:
-                self._clear_stepwise_sampling_state()
+            images = self.solver.sample(
+                x=noise,
+                steps=self.steps,
+                order=self.order,
+            )
         return None, images
     
     # training function
@@ -1300,38 +726,15 @@ class GSWrapperLatent(GSWrapper):
         cond_emb = getattr(self.model.model_fn, "condition", None)
         
         with self._manual_solver_params_context(manual_solver_params):
-            before_step_fn = None
             if manual_solver_params is None:
-                if self.use_stepwise_coeff:
-                    self._stepwise_sampling_timesteps = self.solver.get_time_steps(noise, cond_emb)
-                    self._stepwise_coeff_buffers = None
-                    self._update_dynamic_t_couple(noise=noise, cond_emb=cond_emb)
-                    self._update_dynamic_ac_coefs(noise=noise, cond_emb=cond_emb)
+                self._update_dynamic_t_couple(noise=noise, cond_emb=cond_emb)
+                self._update_dynamic_ac_coefs(noise=noise, cond_emb=cond_emb)
 
-                    def before_step_fn(step_idx: int, x: torch.Tensor) -> None:
-                        self._update_stepwise_coeffs(step_idx, x, cond_emb)
-                        # После обновления live-dict — пишем в solver только скалярные/батчевые
-                        # коэффициенты для текущего шага (не всю матрицу)
-                        live = getattr(self, "_stepwise_live_coeffs", {})
-                        for name, val in live.items():
-                            # val: (B,) — solver._get_step_param ожидает либо (steps,) либо (B, steps)
-                            # Передаём как (B, 1) и выставляем params_step=0, чтобы он брал [:, 0]
-                            self.solver.__setattr__(name, val.unsqueeze(1))   # (B, 1)
-                        if live:
-                            self.solver.params_step = 0   # _get_step_param возьмёт [:, 0]
-                else:
-                    self._update_dynamic_t_couple(noise=noise, cond_emb=cond_emb)
-                    self._update_dynamic_ac_coefs(noise=noise, cond_emb=cond_emb)
-
-            try:
-                latents = self.solver.sample(
-                    x=noise,
-                    steps=self.steps,
-                    order=self.order,
-                    before_step_fn=before_step_fn,
-                )
-            finally:
-                self._clear_stepwise_sampling_state()
+            latents = self.solver.sample(
+                x=noise,
+                steps=self.steps,
+                order=self.order,
+            )
 
         if decode:
             images = self.model.decode(latents)
@@ -1360,26 +763,6 @@ class GSWrapperLatent(GSWrapper):
         d['loss_l2_latents'] = torch.square(latents - student_latents).mean((1, 2, 3))
         d['x0_t'] = self.interpolate_lpips(images)
         d['latents_s'] = student_latents
-
-        apply_repa = self.use_repa and self.repa_loss is not None and (
-            is_train or self.use_repa_in_eval
-        )
-        if apply_repa:
-            dec_grad = getattr(self.loss_config, "repa_grad_through_decoder", True) if is_train else False
-            dec_ctx = torch.enable_grad() if dec_grad else torch.no_grad()
-            with dec_ctx:
-                student_images = self.model.decode(student_latents)
-            d["x0_s"] = self.interpolate_lpips(student_images)
-            log_repa_layers = getattr(self.loss_config, "repa_log_per_layer", False)
-            loss_repa, repa_info = self.repa_loss(
-                student_images=student_images,
-                teacher_images=images,
-                return_detailed=log_repa_layers,
-            )
-            d["loss_repa"] = loss_repa
-            if repa_info is not None:
-                for rk, rv in repa_info.items():
-                    d[rk] = rv
 
         if self.loss_config.loss_type == "GAS":
             with torch.no_grad():
@@ -1411,12 +794,6 @@ class GSWrapperLatent(GSWrapper):
 
         base_loss = d[self.loss_config.loss_key]
         adv_part = self.loss_config.disc_weight * d.get("gen_loss_adv", 0.0)
-        repa_part = torch.tensor(
-            0.0, device=base_loss.device, dtype=base_loss.dtype
-        )
-        if self.use_repa and self.repa_loss is not None and "loss_repa" in d:
-            rw = float(getattr(self.loss_config, "repa_weight", 0.5))
-            repa_part = rw * d["loss_repa"].to(device=base_loss.device, dtype=base_loss.dtype)
-        d["loss_total"] = adv_part + base_loss + repa_part
+        d["loss_total"] = adv_part + base_loss
 
         return d

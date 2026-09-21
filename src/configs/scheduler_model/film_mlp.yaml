@@ -1,8 +1,10 @@
+# Hydra target for PromptNoiseFiLMMlp when used as scheduler_model (e.g. t logits).
+# For a/c film modes, GSWrapper builds PromptNoiseFiLMMlp directly with out_dim=order*steps.
 _target_: src.scheduler_model.PromptNoiseFiLMMlp
 out_dim: 256
 prompt_dim: 768
 hidden_dim: 256
-noise_feat_dim: 3
-noise_encoder_type: "lightconv"      # stats, lightconv, pyramid, patch
+noise_feat_dim: 256
 # Overridden at runtime from student_solver.latent_channels (4 for SD/LDM latents).
 in_channels: 4
+noise_encoder_width: 32

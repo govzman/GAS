@@ -3,27 +3,29 @@ order: 3
 t_eps: 0.001
 latent_channels: 4
 text_embed_dim: 768
-t_couple_parametrization: film_mlp   # diff | film_mlp | prompt_noise_film_mlp
+
+# Coefficient / schedule parametrizations:
+#   t / t_couple: diff | mu_logit | film_mlp | transformer (t only)
+#   a / c:        diff | film_mlp | transformer
+#
+# When a or c uses a network, one head predicts [a_flat | c_flat] (2 * order * steps)
+# and slices become the coefficient tables. a/c must share the same network family
+# (both film_mlp or both transformer).
+t_couple_parametrization: film_mlp
 t_couple_film_hidden_dim: 256
 
-# Backward/forward compatible with code:
-# - legacy key: t_schedule_parametrization
-# - new key:    t_parametrization
-t_parametrization: film_mlp          # diff | transformer | film_mlp | prompt_noise_film_mlp
-t_schedule_parametrization: film_mlp # kept for older configs
+# Legacy alias: t_schedule_parametrization → t_parametrization
+t_parametrization: film_mlp
+t_schedule_parametrization: film_mlp
 t_film_hidden_dim: 256
-a_parametrization: film_mlp          # diff | transformer | film_mlp | film_mlp_diff | diff_transformer
+
+a_parametrization: film_mlp
 c_parametrization: film_mlp
+ac_film_hidden_dim: 256
+
 use_theory_coef: true
 guidance_scale: 7.5
 t_requires_grad: true
 t_couple_requires_grad: true
 a_requires_grad: true
 c_requires_grad: true
-
-# Stepwise coefficient prediction (per solver step, conditioned on x_t)
-use_stepwise_coeff: false
-# stepwise_predictor:
-#   _target_: src.model.gas.stepwise_coeff_predictor.StepwiseCoeffPredictor
-#   hidden_dim: 256
-#   noise_encoder_type: lightconv

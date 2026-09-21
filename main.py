@@ -19,39 +19,12 @@ def _resolve_device(device_cfg: str) -> torch.device:
     return torch.device(device_cfg)
 
 
-def split_parameters(gs_wrapper):
-    a_params = []
-    other_params = []
-
-    for name, p in gs_wrapper.named_parameters():
-        if not p.requires_grad:
-            print('not require grad!', name)
-            continue
-
-        # a conditional model
-        # if name.startswith("a_diff_model") or name.startswith("_a_bias"):
-        # if name.startswith("a") or name.startswith("_a") or name.startswith("c") or name.startswith("_c"):
-        #     a_params.append(p)
-        #     print('a_params:', name)
-        if name.endswith("_model"):
-            a_params.append(p)
-            print('a_params:', name)
-        else:
-            other_params.append(p)
-            print('other_params:', name)
-
-    print("A params:", len(a_params))
-    print("Other params:", len(other_params))
-    return a_params, other_params
-
-
 @hydra.main(version_base=None, config_path="src/configs", config_name="config")
 def main(config: DictConfig) -> None:
     # Freeze/resolve interpolations early (and make cfg printable).
     config = OmegaConf.create(OmegaConf.to_container(config, resolve=True))
 
     # Accelerator handles device / DDP / mixed precision / grad accumulation.
-    # Keep device resolution only as a fallback for non-accelerate paths.
     device = _resolve_device(config.trainer.device)
 
     accumulation_steps = getattr(config.trainer, "accumulation_steps", None)
@@ -66,7 +39,6 @@ def main(config: DictConfig) -> None:
     )
     device = accelerator.device
 
-    # Setup seed (kept separate from model/dataset config on purpose).
     set_global_seed(config.trainer.seed)
 
     # Auto-name run if not provided.
@@ -80,10 +52,8 @@ def main(config: DictConfig) -> None:
     if config.writer.run_name is None:
         config.writer.run_name = f"{solver_config.student_name}_{dataset_config.teacher_pkl}_{loss_type}"
 
-    # Setup dataset
     data = SyntDataLoaders(dataset_config)
 
-    # Setup model
     model_config = config.model
     model_config.t_eps = solver_config.t_eps
     model_config.guidance_scale = solver_config.guidance_scale
@@ -91,10 +61,9 @@ def main(config: DictConfig) -> None:
     base_model = load_base_model(model_config, device)
     gs_wrapper = get_gs_wrapper(base_model, config)
 
-    # Setup training
-    a_params, other_params = split_parameters(gs_wrapper)
-    optim = instantiate(config.optimizer, params=other_params) if other_params else None
-    optim_a_params = instantiate(config.optimizer_a_params, params=a_params) if a_params else None
+    # Single optimizer over all trainable parameters.
+    trainable = [p for p in gs_wrapper.parameters() if p.requires_grad]
+    optim = instantiate(config.optimizer, params=trainable) if trainable else None
 
     ema = ExponentialMovingAverage(gs_wrapper.parameters(), decay=config.trainer.ema_decay)
     n_iters = config.trainer.n_iters
@@ -108,15 +77,10 @@ def main(config: DictConfig) -> None:
         ema=ema,
         data=data,
         optim=optim,
-        optim_a_params=optim_a_params,
         device=device,
         accelerator=accelerator,
     )
 
 
-# ----------------------------------------------------------------------------
-
 if __name__ == "__main__":
     main()
-
-# ----------------------------------------------------------------------------

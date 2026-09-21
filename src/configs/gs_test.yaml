@@ -16,15 +16,6 @@ optimizer:
 #   T_max: ${trainer.n_iters}
 #   eta_min: 0.0
 
-optimizer_a_params:
-  _target_: torch.optim.AdamW
-  lr: 3.0e-4
-
-# lr_scheduler_a_params:
-#   _target_: torch.optim.lr_scheduler.CosineAnnealingLR
-#   T_max: ${trainer.n_iters}
-#   eta_min: 0.0
-
 loss_config:
   loss_type: "GS"
   loss_key: loss_l1_latents
@@ -44,7 +35,6 @@ trainer:
   checkpoints_dir: "./checkpoints/04_28_04_14_29"
   print_gt_solver_every: 100
 
-# Дополнительные поля из JSON, не входившие в исходный gs.yaml
 cn: "gs.yaml"
 curr_step: "2662"
 
@@ -68,11 +58,13 @@ model:
   t_eps: 0.001
   type: "SD"
 
+# Example: one FiLM head for a||c; t from stick-breaking mu_logit.
 student_solver:
   a_parametrization: "film_mlp"
   a_requires_grad: true
   c_parametrization: "film_mlp"
   c_requires_grad: true
+  ac_film_hidden_dim: 256
   guidance_scale: 7.5
   order: 3
   steps: 4
@@ -81,22 +73,8 @@ student_solver:
   t_parametrization: "mu_logit"
   t_requires_grad: true
   use_theory_coef: true
-  freeze_mlp_steps: 0
-  use_shared_ac_backbone: true
-
-  noise_encoder:
-    _target_:  src.scheduler_model.film_mlp.noise_encoders.noise_encoders.LightConvNoiseEncoder
-    feat_dim: 256
-    in_channels: 4 # latent_channels
-    base_width: 32
-
-  ac_backbone:
-    _target_: src.scheduler_model.film_mlp_shared.SharedPromptNoiseFiLMBackbone
-    prompt_dim: 768
-    hidden_dim: 256
-    latent_dim: 256
-    head_hidden_dim: 128
-    noise_encoder: null
+  latent_channels: 4
+  text_embed_dim: 768
 
 teacher_solver:
   guidance_scale: 7.5
@@ -112,18 +90,3 @@ writer:
   project_name: "test_GAS"
   run_name: "film_mlp 1400 images"
   workspace: "govzman"
-
-noise_encoder:
-    _target_:  src.scheduler_model.film_mlp.noise_encoders.noise_encoders.LightConvNoiseEncoder
-    feat_dim: 256
-    in_channels: 4 # latent_channels
-    base_width: 32
-
-# Shared backbone для A и C
-ac_backbone:
-    _target_: src.scheduler_model.film_mlp_shared.SharedPromptNoiseFiLMBackbone
-    prompt_dim: 768
-    hidden_dim: 256
-    latent_dim: 256
-    head_hidden_dim: 128
-    noise_encoder: null

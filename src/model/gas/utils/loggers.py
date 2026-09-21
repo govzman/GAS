@@ -105,52 +105,6 @@ def log_final_solver_grads(
     exp.log_metrics(coeffs_to_metric_dict(grads, prefix=prefix, suff=suff), step=global_step)
 
 
-@torch.no_grad()
-def log_stepwise_vis_metrics(
-    exp: comet_ml.Experiment,
-    trace: Mapping[str, List[float]],
-    global_step: int,
-    key_prefix: str = "stepwise_vis",
-    suff: str = "",
-) -> None:
-    """Log per-solver-step scalar traces collected on the vis batch."""
-    d: Dict[str, float] = {}
-    prefix = f"{key_prefix}{suff}"
-    for name, values in trace.items():
-        if not values:
-            continue
-        arr = np.asarray(values, dtype=np.float64)
-        for step_i, v in enumerate(arr):
-            d[f"{prefix}/{name}/step_{step_i:02d}"] = float(v)
-        d[f"{prefix}/{name}/mean"] = float(arr.mean())
-        d[f"{prefix}/{name}/std"] = float(arr.std()) if arr.size > 1 else 0.0
-        d[f"{prefix}/{name}/delta_last"] = float(arr[-1] - arr[0]) if arr.size > 1 else 0.0
-    if d:
-        exp.log_metrics(d, step=global_step)
-
-
-@torch.no_grad()
-def log_stepwise_vis_plot(
-    exp: comet_ml.Experiment,
-    trace: Mapping[str, List[float]],
-    global_step: int,
-    key: str = "stepwise_vis/trajectory",
-) -> None:
-    if not trace:
-        return
-    fig, ax = plt.subplots(1, 1, figsize=(8, 4))
-    for name, values in sorted(trace.items()):
-        if not values:
-            continue
-        ax.plot(values, marker="o", markersize=3, label=name, alpha=0.85)
-    ax.set_xlabel("Solver step")
-    ax.set_ylabel("Coefficient (batch mean)")
-    ax.set_title("Stepwise coefficient trajectory (vis batch)")
-    ax.grid(True, alpha=0.3)
-    ax.legend(fontsize=8, ncol=2)
-    log_plt_fig(exp=exp, fig=fig, key=key, global_step=global_step)
-
-
 def log_plt_fig(exp: comet_ml.Experiment, fig, key: str, global_step: int) -> None:
     fig.tight_layout()
 

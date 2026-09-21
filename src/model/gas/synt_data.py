@@ -35,11 +35,14 @@ def move_batch_to_device(batch: Tuple[Any, ...], device: torch.device) -> Tuple[
 
 
 class SyntDataset(Dataset):
-    """Dataset class.
-    Expects dataset in format as done in generate.py / collate.py (teacher pickle).
+    """Teacher pickle dataset (see generate.py / collate.py).
 
-    If the pickle contains flattened keys ``manual_solver_params.<name>``, each sample
-    returns a dict of those tensors as the 5th tuple element for training-time GT comparison.
+    Each item is ``(noise, images, latents, condition[, gt_solver_params])``.
+
+    Synthetic GS teachers may store ground-truth coefficients under flattened
+    keys ``manual_solver_params.<name>``. When present, those tensors are returned
+    as the optional 5th element so training can log GT vs predicted MSE without
+    changing the distillation loss.
     """
 
     def __init__(self, dataset_path: str):
@@ -51,6 +54,7 @@ class SyntDataset(Dataset):
         self.latent_key = "latents"
         self.condition_key = "condition"
 
+        # Discover GT solver coefficient tensors written by synthetic generation.
         self.gt_solver_param_names: List[str] = sorted(
             k[len(GT_SOLVER_PREFIX) :]
             for k in self.data.keys()

@@ -1,14 +1,15 @@
 import datetime
 import os
 import time
+from typing import Optional
 
+import comet_ml
 import torch
+from hydra.utils import instantiate
+from omegaconf import OmegaConf
 from torch_ema import ExponentialMovingAverage
 from tqdm import tqdm
 
-import comet_ml
-from hydra.utils import instantiate
-from omegaconf import OmegaConf
 from evaluate import NOT_LOG_KEYS, evaluate_wrapper
 from src.model.gas.gs_wrapper import GSWrapper
 from src.model.gas.synt_data import SyntDataset, move_batch_to_device
@@ -20,7 +21,6 @@ from src.model.gas.utils.loggers import (
     log_weights,
     print_final_solver_coeffs,
 )
-from typing import Optional
 
 
 def train(
@@ -29,7 +29,6 @@ def train(
     ema: ExponentialMovingAverage,
     data: SyntDataset,
     optim: torch.optim.Adam,
-    optim_a_params: torch.optim.Adam,
     device: torch.device,
     accelerator: Optional[object] = None,
 ):
@@ -40,33 +39,24 @@ def train(
     if accelerator is not None:
         is_main = bool(getattr(accelerator, "is_main_process", True))
         device = getattr(accelerator, "device", device)
-            
+
         if optim:
             optim = accelerator.prepare(optim)
-        if optim_a_params:
-            optim_a_params = accelerator.prepare(optim_a_params)
-        
+
         gs_wrapper, data.train_loader, data.test_loader = accelerator.prepare(
             gs_wrapper, data.train_loader, data.test_loader
         )
-        
-    freeze_steps = getattr(config.student_solver, 'freeze_mlp_steps', 0)
-    if freeze_steps > 0 and is_main:
-        print(f"🧊 MLP will be DISABLED for first {freeze_steps} steps (masking, not freezing)")
 
     lr_scheduler = None
-    lr_scheduler_a_params = None
     if optim and hasattr(config, "lr_scheduler") and config.lr_scheduler is not None:
         lr_scheduler = instantiate(config.lr_scheduler, optimizer=optim)
-    if optim_a_params and hasattr(config, "lr_scheduler_a_params") and config.lr_scheduler_a_params is not None:
-        lr_scheduler_a_params = instantiate(config.lr_scheduler_a_params, optimizer=optim_a_params)
 
     if is_main:
         dir = os.path.join("./checkpoints", date_str)
         os.makedirs(dir, exist_ok=False)
         config.trainer.checkpoints_dir = dir
 
-        print(f"\n🚀 START TRAINING: {date_str}")
+        print(f"\nSTART TRAINING: {date_str}")
         print("=" * 40 + " Config Info " + "=" * 40)
         print(config)
         print("=" * 90 + "\n")
@@ -97,52 +87,8 @@ def train(
             if global_step == config.trainer.n_iters:
                 break
             global_step += 1
-            # ⭐ КЛЮЧЕВОЕ ИЗМЕНЕНИЕ: просто переключаем флаг
-            if freeze_steps > 0 and global_step == freeze_steps:
-                gs_wrapper.mlp_disabled = False
-                if is_main:
-                    print(f"🔓 MLP ENABLED at step {global_step}")
-            
-            # ⭐ ДИАГНОСТИКА после включения MLP
-            if freeze_steps > 0 and global_step == freeze_steps + 1 and is_main:
-                print("\n🔍 DIAGNOSTIC: Checking MLP after enabling")
-
-                # Проверка a_diff_model
-                if hasattr(gs_wrapper, 'a_diff_model') and gs_wrapper.a_diff_model is not None:
-                    print("=== a_diff_model ===")
-                    for name, param in gs_wrapper.a_diff_model.named_parameters():
-                        if param.grad is not None:
-                            print(f"  {name}: grad_norm={param.grad.norm().item():.6f}, "
-                                  f"param_norm={param.norm().item():.6f}, "
-                                  f"requires_grad={param.requires_grad}")
-                        else:
-                            print(f"  {name}: grad=None, requires_grad={param.requires_grad}")
-
-                # Проверка c_diff_model
-                if hasattr(gs_wrapper, 'c_diff_model') and gs_wrapper.c_diff_model is not None:
-                    print("=== c_diff_model ===")
-                    for name, param in gs_wrapper.c_diff_model.named_parameters():
-                        if param.grad is not None:
-                            print(f"  {name}: grad_norm={param.grad.norm().item():.6f}, "
-                                  f"param_norm={param.norm().item():.6f}, "
-                                  f"requires_grad={param.requires_grad}")
-                        else:
-                            print(f"  {name}: grad=None, requires_grad={param.requires_grad}")
-
-                # Проверка базовых diff параметров
-                print("=== base diff params ===")
-                for i in range(1, gs_wrapper.order + 1):
-                    for prefix in ['a', 'c']:
-                        pname = f'{prefix}{i}_diff'
-                        if hasattr(gs_wrapper, pname):
-                            param = getattr(gs_wrapper, pname)
-                            if param.grad is not None:
-                                print(f"  {pname}: grad_norm={param.grad.norm().item():.6f}, "
-                                      f"param_norm={param.norm().item():.6f}")
-                print()
 
             t_start = time.time()
-
             batch = move_batch_to_device(batch, device)
 
             log_solver_coeffs = (
@@ -173,17 +119,12 @@ def train(
                         )
 
                     grad_norm = torch.nn.utils.clip_grad_norm_(gs_wrapper.parameters(), 1.0)
-                    
+
                     if optim:
                         optim.step()
                         if lr_scheduler is not None:
                             lr_scheduler.step()
                         optim.zero_grad()
-                    if optim_a_params:
-                        optim_a_params.step()
-                        if lr_scheduler_a_params is not None:
-                            lr_scheduler_a_params.step()
-                        optim_a_params.zero_grad()
                     ema.update(gs_wrapper.parameters())
 
                     if exp is not None and global_step % config.writer.log_weights_freq == 0:
@@ -198,8 +139,6 @@ def train(
                     log_d["optim/grad_norm"] = grad_norm
                     if optim:
                         log_d["optim/lr"] = optim.param_groups[0]["lr"]
-                    if optim_a_params:
-                        log_d["optim_a_params/lr"] = optim_a_params.param_groups[0]["lr"]
             else:
                 with accelerator.accumulate(gs_wrapper):
                     with accelerator.autocast():
@@ -230,11 +169,6 @@ def train(
                             if lr_scheduler is not None:
                                 lr_scheduler.step()
                             optim.zero_grad()
-                        if optim_a_params:
-                            optim_a_params.step()
-                            if lr_scheduler_a_params is not None:
-                                lr_scheduler_a_params.step()
-                            optim_a_params.zero_grad()
                         ema.update(gs_wrapper.parameters())
 
                         if exp is not None and global_step % config.writer.log_weights_freq == 0:
@@ -249,21 +183,20 @@ def train(
                         log_d["optim/grad_norm"] = float(grad_norm)
                         if optim:
                             log_d["optim/lr"] = optim.param_groups[0]["lr"]
-                        if optim_a_params:
-                            log_d["optim_a_params/lr"] = optim_a_params.param_groups[0]["lr"]
 
             for k, v in res_d.items():
                 if k not in NOT_LOG_KEYS:
                     log_d[f"train/{k}"] = v.mean().item()
 
             if log_solver_coeffs:
-                final_coeffs = gs_wrapper.get_final_solver_coeff_tensors()  # сырые тензоры
+                final_coeffs = gs_wrapper.get_final_solver_coeff_tensors()
                 print_final_solver_coeffs(
                     final_coeffs,
                     header=f"[train step {global_step}]",
                     max_samples=2,
                 )
 
+            # Synthetic teachers may carry GT manual_solver_params.*; log MSE periodically.
             print_every = int(getattr(config.trainer, "print_gt_solver_every", 0))
             if is_main and print_every > 0 and global_step % print_every == 0:
                 gt_mse_keys = sorted(
@@ -272,12 +205,16 @@ def train(
                 if gt_mse_keys:
                     mean_line = ""
                     if "gt_mse_mean" in res_d:
-                        mean_line = f"gt_mse_mean(batch avg)={res_d['gt_mse_mean'].mean().item():.6g} | "
+                        mean_line = (
+                            f"gt_mse_mean(batch avg)={res_d['gt_mse_mean'].mean().item():.6g} | "
+                        )
                     detail = " | ".join(
                         f"{k[len('gt_mse_'):]}={res_d[k].mean().item():.6g}"
                         for k in gt_mse_keys
                     )
-                    print(f"[train step {global_step}] GT coeff MSE vs predicted — {mean_line}{detail}")
+                    print(
+                        f"[train step {global_step}] GT coeff MSE vs predicted — {mean_line}{detail}"
+                    )
 
             if exp is not None:
                 exp.log_metrics(log_d, step=global_step)
@@ -328,7 +265,7 @@ def train(
                 model_to_save = gs_wrapper
                 if accelerator is not None:
                     model_to_save = accelerator.unwrap_model(gs_wrapper)
-            
+
                 ckpt = {
                     "ema": ema.state_dict(),
                     "model": model_to_save.state_dict(),
@@ -338,10 +275,6 @@ def train(
                     ckpt["optim"] = optim.state_dict()
                 if lr_scheduler is not None:
                     ckpt["lr_scheduler"] = lr_scheduler.state_dict()
-                if optim_a_params:
-                    ckpt["optim_a_params"] = optim_a_params.state_dict()
-                if lr_scheduler_a_params is not None:
-                    ckpt["lr_scheduler_a_params"] = lr_scheduler_a_params.state_dict()
                 ckpt_path = os.path.join(dir, f"{global_step}.pt")
                 if accelerator is not None:
                     accelerator.save(ckpt, ckpt_path)
@@ -350,5 +283,3 @@ def train(
 
             if pbar is not None:
                 pbar.update(1)
-
-    # comet_ml.finish()

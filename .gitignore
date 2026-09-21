@@ -181,3 +181,5 @@ all-scripts/
 myenv/
 outputs/
 core*
+
+llm_text.py

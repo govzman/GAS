@@ -32,21 +32,14 @@ class GeneralizedSolver:
 
         Supports:
         - (steps,)
-        - (B, steps)
-        Applies residual scaling if enabled.
+        - (B, steps) for conditional (FiLM / transformer) coefficient tables
         """
-
         p = self.__getattribute__(name)
 
-        # select step
         if isinstance(p, torch.Tensor) and p.ndim == 2:
-            p = p[:, self.params_step]     # (B,)
+            p = p[:, self.params_step]  # (B,)
         else:
-            p = p[self.params_step]        # scalar
-
-        # optional residual scaling
-        if hasattr(self, "coeff_residual_scale"):
-            p = self.coeff_residual_scale * p
+            p = p[self.params_step]  # scalar
 
         if ref is not None:
             p = self._match_coeff_shape(p, ref)
@@ -408,14 +401,13 @@ class GeneralizedSolver:
         return x_t
 
     def sample(
-        self, 
-        x: torch.Tensor, 
-        steps: int, 
-        order: int, 
-        before_step_fn: Optional[Any] = None,
-        **kwargs
+        self,
+        x: torch.Tensor,
+        steps: int,
+        order: int,
+        **kwargs,
     ) -> torch.Tensor:
-        """Sample from diffuision ODE.
+        """Sample from diffusion ODE.
         Use x like initial value and NFE=steps.
 
         Args:
@@ -424,7 +416,7 @@ class GeneralizedSolver:
             order (int): Solver order (determines the number of previous steps used).
 
         Returns:
-            torch.Tensor: The approximated solution.        
+            torch.Tensor: The approximated solution.
         """
         assert steps >= order
         self.params_step = 0
@@ -440,17 +432,10 @@ class GeneralizedSolver:
             t = timesteps[0]
         t_prev_list = [t]
 
-        # Ensure dynamic step-wise parameters are synced with current batch
-        # before the very first model evaluation (step index 0).
-        if before_step_fn is not None:
-            before_step_fn(step_idx=0, x=x)
-
         model_prev_list = [self.model_fn(x, t)]
         x_prev_list = [x]
 
         for step in range(1, steps + 1):
-            if before_step_fn is not None:
-                before_step_fn(step_idx=step - 1, x=x)
             t = timesteps[:, step] if timesteps.ndim == 2 else timesteps[step]
             cur_order = min(step, order)
             x = self.solver_update(x, model_prev_list, t_prev_list, t, order=cur_order, x_prev_list=x_prev_list)
