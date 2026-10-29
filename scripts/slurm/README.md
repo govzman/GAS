@@ -1,10 +1,8 @@
 # Controlled synthetic experiments
 
 Run these scripts from the directory that contains `GAS/`, as in the existing
-cluster workflow. Under Slurm, the scripts locate the checkout via
-`SLURM_SUBMIT_DIR/GAS`, since Slurm executes a spool-file rather than the
-original script. Slurm keeps `outputs/*.out` and `outputs/*.err` relative to
-that parent directory.
+cluster workflow. Each script begins with `cd GAS`, so Slurm keeps
+`outputs/*.out` and `outputs/*.err` relative to that parent directory.
 
 One-time remote setup:
 

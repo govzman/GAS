@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
-# Source this helper from an experiment launcher; do not execute it directly.
-
-_gas_repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-_gas_env_file="${_gas_repo_root}/.env"
+# Source this helper after ``cd GAS`` in an experiment launcher.
+_gas_env_file=".env"
 
 if [[ ! -f "${_gas_env_file}" ]]; then
   echo "Missing ${_gas_env_file}. Copy .env.example to .env and set COMET_API_KEY." >&2

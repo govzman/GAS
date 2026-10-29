@@ -11,14 +11,9 @@
 #SBATCH --constraint=type_a|type_b|type_c
 
 set -euo pipefail
-if [[ -n "${SLURM_SUBMIT_DIR:-}" && -d "${SLURM_SUBMIT_DIR}/GAS" ]]; then
-  REPO_ROOT="${SLURM_SUBMIT_DIR}/GAS"
-else
-  REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-fi
-cd "${REPO_ROOT}"
-source "${REPO_ROOT}/scripts/load_env.sh"
-source "${REPO_ROOT}/gas/bin/activate"
+cd GAS
+source scripts/load_env.sh
+source gas/bin/activate
 
 HYDRA_FULL_ERROR=1 python main.py --config-name gs_synt \
   datasets=synt_prompt_dependent \
