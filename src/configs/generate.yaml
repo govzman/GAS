@@ -24,11 +24,19 @@ device: cuda
 synthetic_gs_dataset:
   enabled: true
   count: 100
-  nfe: 5
+  # Match the 4-step student during the controlled recovery experiment.
+  # A 5-to-4 distillation run is a separate later experiment.
+  nfe: 4
   order: 3
-  coef_std: 0.01
-  t_couple_std: 0.01
-  include_t_couple: true
-  include_timesteps: false
-  t_std: 0.005
+  # Controlled teacher target. ``prompt_projection`` is a deterministic,
+  # prompt-only function of frozen SD text embeddings; ``constant`` is GAS.
+  coefficient_mode: prompt_projection
+  coefficient_seed: 31415
+  base_std: 0.01
+  residual_std: 0.01
+  projection_gain: 12.0
+  # ``unique`` gives one noise per sample; ``fixed`` repeats noise_seed.
+  noise_mode: unique
+  noise_seed: 10000
+  prompt_seed: 2026
   prompts: null

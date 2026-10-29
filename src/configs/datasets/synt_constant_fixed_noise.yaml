@@ -1,0 +1,10 @@
+teacher_pkl: data/teachers/sd-v1/synthetic/constant_fixed_noise/dataset.pkl
+use_latents: true
+use_condition: true
+train_size: 80
+validation_size: 20
+batch_size: 4
+validation_batch_size: 4
+size_vis: 4
+dataset_shift: 0
+num_workers: 1

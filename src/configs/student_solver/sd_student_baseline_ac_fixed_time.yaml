@@ -1,0 +1,20 @@
+# Fair GAS control for the controlled synthetic experiment: the same 4-step
+# solver, with global a/c tables and no learnable schedule or time offsets.
+steps: 4
+order: 3
+t_eps: 0.001
+latent_channels: 4
+text_embed_dim: 768
+
+t_parametrization: diff
+t_couple_parametrization: diff
+t_requires_grad: false
+t_couple_requires_grad: false
+
+a_parametrization: diff
+c_parametrization: diff
+a_requires_grad: true
+c_requires_grad: true
+
+use_theory_coef: true
+guidance_scale: 7.5

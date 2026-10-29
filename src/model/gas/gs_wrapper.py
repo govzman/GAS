@@ -132,41 +132,29 @@ class GSWrapper(nn.Module):
         self._validate_ac_parametrization(self.a_parametrization, "a_parametrization")
         self._validate_ac_parametrization(self.c_parametrization, "c_parametrization")
         self.ac_coeff_model = None
-        self._ac_bias = None
         self._ac_half_dim = self.order * self.steps
 
         self._init_ac_coeff_model(config)
 
-        # Learnable global coeffs only for pure diff mode.
-        if self.a_parametrization == "diff":
+        # ``diff`` is the GAS baseline. Conditional modes use the same learnable
+        # global table plus a zero-initialized, context-dependent residual.
+        # Keeping the two parts explicit makes the conditional experiment a fair
+        # extension of the baseline rather than an unrelated parametrization.
+        for prefix, parametrization, requires_grad in (
+            ("a", self.a_parametrization, self.solver_config.a_requires_grad),
+            ("c", self.c_parametrization, self.solver_config.c_requires_grad),
+        ):
+            suffix = "diff" if parametrization == "diff" else "global"
             for i in range(1, self.order + 1):
-                aname = f"a{i}_diff"
+                pname = f"{prefix}{i}_{suffix}"
                 self.register_parameter(
-                    name=aname,
+                    name=pname,
                     param=nn.Parameter(
                         torch.zeros(self.steps),
-                        requires_grad=self.solver_config.a_requires_grad,
+                        requires_grad=requires_grad,
                     ),
                 )
-                solver.__setattr__(aname, self.__getattr__(aname))
-        else:
-            for i in range(1, self.order + 1):
-                solver.__setattr__(f"a{i}_diff", torch.zeros(self.steps))
-
-        if self.c_parametrization == "diff":
-            for i in range(1, self.order + 1):
-                cname = f"c{i}_diff"
-                self.register_parameter(
-                    name=cname,
-                    param=nn.Parameter(
-                        torch.zeros(self.steps),
-                        requires_grad=self.solver_config.c_requires_grad,
-                    ),
-                )
-                solver.__setattr__(cname, self.__getattr__(cname))
-        else:
-            for i in range(1, self.order + 1):
-                solver.__setattr__(f"c{i}_diff", torch.zeros(self.steps))
+                solver.__setattr__(f"{prefix}{i}_diff", self.__getattr__(pname))
 
         # theory coef
         solver.use_theory_coef = self.solver_config.use_theory_coef
@@ -188,8 +176,6 @@ class GSWrapper(nn.Module):
                 getattr(self.solver_config, "c_requires_grad", True)
             )
             set_requires_grad(self.ac_coeff_model, ac_grad)
-            if self._ac_bias is not None:
-                self._ac_bias.requires_grad = ac_grad
 
         if self.t_couple_parametrization != "diff":
             set_requires_grad(self.t_couple_model, self.solver_config.t_couple_requires_grad)
@@ -270,8 +256,6 @@ class GSWrapper(nn.Module):
             self.ac_coeff_model = self._instantiate_with_latent_channels(
                 ac_cfg, num_timesteps=out_dim
             )
-
-        self._ac_bias = nn.Parameter(torch.zeros(out_dim), requires_grad=True)
 
     def _instantiate_with_latent_channels(self, cfg, **kwargs):
         """Hydra-instantiate a scheduler model.
@@ -377,13 +361,25 @@ class GSWrapper(nn.Module):
         noise: torch.Tensor,
         cond_emb: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Run the single a/c head and split into a_flat, c_flat (each order*steps)."""
+        """Return global tables plus the context-dependent residual for a and c."""
         half = self._ac_half_dim
         if cond_emb is not None:
             flat = self.ac_coeff_model(noise, cond_emb)
         else:
-            flat = self._ac_bias.reshape(1, -1).expand(noise.shape[0], -1)
-        return flat[:, :half], flat[:, half:]
+            flat = torch.zeros(
+                noise.shape[0], 2 * half, device=noise.device, dtype=noise.dtype
+            )
+        a_global = self._global_ac_flat("a", noise)
+        c_global = self._global_ac_flat("c", noise)
+        return a_global + flat[:, :half], c_global + flat[:, half:]
+
+    def _global_ac_flat(self, prefix: str, noise: torch.Tensor) -> torch.Tensor:
+        """Expand the explicit global a/c table to the current batch."""
+        suffix = "diff" if getattr(self, f"{prefix}_parametrization") == "diff" else "global"
+        table = torch.stack(
+            [getattr(self, f"{prefix}{i}_{suffix}") for i in range(1, self.order + 1)]
+        )
+        return table.reshape(1, -1).expand(noise.shape[0], -1)
 
     def _attach_ac_side(
         self,
@@ -417,6 +413,35 @@ class GSWrapper(nn.Module):
         a_flat, c_flat = self._predict_ac_flat(noise, cond_emb)
         self._attach_ac_side("a", self.a_parametrization, a_flat)
         self._attach_ac_side("c", self.c_parametrization, c_flat)
+
+    def _add_context_sensitivity_metrics(
+        self,
+        d: dict,
+        noise: torch.Tensor,
+        cond_emb: Optional[torch.Tensor],
+    ) -> None:
+        """Measure whether the a/c predictor reacts to prompt or initial noise.
+
+        These are diagnostics only: no target is changed and no gradient is
+        added. With a prompt-dependent synthetic teacher, prompt permutation
+        should eventually alter coefficients while noise permutation should not.
+        Both deltas should approach zero for a constant synthetic teacher.
+        """
+        if self.ac_coeff_model is None or cond_emb is None or noise.shape[0] < 2:
+            return
+
+        a_ref, c_ref = self._predict_ac_flat(noise, cond_emb)
+        prompt_perm = torch.roll(cond_emb, shifts=1, dims=0)
+        noise_perm = torch.roll(noise, shifts=1, dims=0)
+        a_prompt, c_prompt = self._predict_ac_flat(noise, prompt_perm)
+        a_noise, c_noise = self._predict_ac_flat(noise_perm, cond_emb)
+
+        d["coeff_delta_prompt_permute"] = torch.cat(
+            [a_ref - a_prompt, c_ref - c_prompt], dim=1
+        ).abs().mean(dim=1)
+        d["coeff_delta_noise_permute"] = torch.cat(
+            [a_ref - a_noise, c_ref - c_noise], dim=1
+        ).abs().mean(dim=1)
 
     # timesteps logic
     def get_t_steps(self, noise=None, cond_emb=None, **kwargs) -> torch.Tensor:
@@ -653,6 +678,7 @@ class GSWrapper(nn.Module):
         _, student_images = self.student_sampler_fn(noise)
         cond_emb = getattr(self.model.model_fn, "condition", None)
         self._add_gt_solver_metrics(d, gt_solver_params, noise, cond_emb)
+        self._add_context_sensitivity_metrics(d, noise, cond_emb)
 
         d['loss_l1'] = torch.abs(student_images - images).mean((1, 2, 3))
         d['loss_l2'] = torch.square(student_images - images).mean((1, 2, 3))
@@ -758,6 +784,7 @@ class GSWrapperLatent(GSWrapper):
         )
         cond_emb = getattr(self.model.model_fn, "condition", None)
         self._add_gt_solver_metrics(d, gt_solver_params, noise, cond_emb)
+        self._add_context_sensitivity_metrics(d, noise, cond_emb)
 
         d['loss_l1_latents'] = torch.abs(latents - student_latents).mean((1, 2, 3))
         d['loss_l2_latents'] = torch.square(latents - student_latents).mean((1, 2, 3))

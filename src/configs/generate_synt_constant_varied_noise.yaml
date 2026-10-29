@@ -1,0 +1,34 @@
+defaults:
+  - model: coco
+  - scheduler_model: scheduler_transformer
+  - writer: cometml
+  - datasets: coco
+  - student_solver: sd_student_conditional_ac
+  - teacher_solver: sd_teacher_default
+  - _self_
+
+loss_config:
+  loss_type: GS
+  loss_key: loss_l1_latents
+
+outdir: data/teachers/sd-v1/synthetic/constant_varied_noise
+seeds: "0-99"
+max_batch_size: 1
+checkpoint_path: null
+create_dataset: true
+device: cuda
+
+synthetic_gs_dataset:
+  enabled: true
+  count: 100
+  nfe: 4
+  order: 3
+  coefficient_mode: constant
+  coefficient_seed: 31415
+  base_std: 0.01
+  residual_std: 0.0
+  projection_gain: 12.0
+  noise_mode: unique
+  noise_seed: 10000
+  prompt_seed: 2026
+  prompts: null

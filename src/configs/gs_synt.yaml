@@ -2,8 +2,8 @@ defaults:
   - model: coco
   - scheduler_model: scheduler_transformer
   - writer: cometml
-  - datasets: synt
-  - student_solver: sd_student_baseline
+  - datasets: synt_prompt_dependent
+  - student_solver: sd_student_conditional_ac
   - teacher_solver: sd_teacher_default
   - _self_
 
@@ -28,7 +28,7 @@ trainer:
   epoch_num: 2500
   # Synthetic pickle may include manual_solver_params.*; print GT MSE this often (0 = off).
   print_gt_solver_every: 25
-  accumulation_steps: 4
+  accumulation_steps: 1
   # accelerate mixed_precision expects: "no" | "fp16" | "bf16"
   amp: "no"
   ema_decay: 0.999

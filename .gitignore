@@ -179,7 +179,8 @@ all-scripts/
 .vscode/
 .cometml-runs/
 myenv/
-outputs/
+outputs/*
+!outputs/.gitkeep
 core*
 
 llm_text.py

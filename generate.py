@@ -1,7 +1,7 @@
 import os
 import re
 from functools import partial
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import hydra
 import numpy as np
@@ -75,48 +75,98 @@ def parse_prompts_list(prompts: Optional[Any]) -> Optional[List[str]]:
     return [p.strip() for p in str(prompts).split("|") if p.strip()]
 
 
-def sample_manual_gs_params(
-    gs_wrapper,
-    batch_size: int,
-    device: torch.device,
-    cfg: DictConfig,
-    seed: int,
-) -> Dict[str, torch.Tensor]:
-    """Sample random GS coefficients for synthetic teacher generation.
+def _make_generator(device: torch.device, seed: int) -> torch.Generator:
+    return torch.Generator(device=device).manual_seed(int(seed) % (1 << 32))
 
-    Used when ``synthetic_gs_dataset.enabled`` is set: each sample gets its own
-    a*/c*/t_couple (and optionally timesteps) so the pickle can store
-    ``manual_solver_params.*`` for later GT comparison during student training.
+
+class SyntheticCoefficientMapper:
+    """Deterministic teacher a/c targets for controlled context experiments.
+
+    ``constant`` implements the original GAS assumption: all samples share one
+    coefficient table. ``prompt_projection`` uses one fixed scalar feature of
+    the frozen SD text embedding, so the target depends on prompt and on nothing
+    else. Only active solver entries are perturbed; inactive high-order entries
+    remain zero because they cannot affect a trajectory.
     """
-    coef_std = float(getattr(cfg, "coef_std", 0.01))
-    t_couple_std = float(getattr(cfg, "t_couple_std", coef_std))
-    t_std = float(getattr(cfg, "t_std", coef_std))
-    include_t_couple = bool(getattr(cfg, "include_t_couple", True))
-    include_timesteps = bool(getattr(cfg, "include_timesteps", False))
 
-    steps = int(gs_wrapper.steps)
-    order = int(gs_wrapper.order)
-    params = {}
-    
-    torch.manual_seed(seed)
-    for i in range(1, order + 1):
-        params[f"a{i}_diff"] = torch.randn(batch_size, steps, device=device) * coef_std
-        params[f"c{i}_diff"] = torch.randn(batch_size, steps, device=device) * coef_std
+    def __init__(self, gs_wrapper, cfg: DictConfig, device: torch.device):
+        self.steps = int(gs_wrapper.steps)
+        self.order = int(gs_wrapper.order)
+        self.mode = str(getattr(cfg, "coefficient_mode", "constant"))
+        if self.mode not in {"constant", "prompt_projection"}:
+            raise ValueError(f"Unknown synthetic coefficient_mode={self.mode!r}")
 
-    if include_t_couple:
-        params["t_couple"] = torch.randn(batch_size, steps, device=device) * t_couple_std
+        seed = int(getattr(cfg, "coefficient_seed", 0))
+        generator = _make_generator(device, seed)
+        self.base_std = float(getattr(cfg, "base_std", 0.01))
+        self.residual_std = float(getattr(cfg, "residual_std", 0.01))
+        self.projection_gain = float(getattr(cfg, "projection_gain", 12.0))
 
-    if include_timesteps:
-        base_t = torch.linspace(1.0, gs_wrapper.t_eps, steps + 1, device=device).flip(0)
-        base_logits = gs_wrapper.get_inv_t_steps(base_t).reshape(1, -1).repeat(batch_size, 1)
-        logits = base_logits + torch.randn_like(base_logits) * t_std
-        params["timesteps"] = gs_wrapper.get_mu_t_steps(logits).flip(1)
-    else:
-        base_t = torch.linspace(1.0, gs_wrapper.t_eps, steps + 1, device=device).flip(0)
-        logits = gs_wrapper.get_inv_t_steps(base_t).reshape(1, -1).repeat(batch_size, 1)
-        params["timesteps"] = gs_wrapper.get_mu_t_steps(logits).flip(1)
-        # params["timesteps"] = torch.linspace(1., gs_wrapper.t_eps, steps + 1, device=device).repeat(batch_size, 1) # torch.tensor([[1.0000, 0.7502, 0.5005, 0.2508, 0.0010]], device=device)
-    return params
+        active = torch.zeros(self.order, self.steps, device=device)
+        for order_idx in range(self.order):
+            active[order_idx, order_idx:] = 1.0
+        self.active = active
+
+        self.base_a = torch.randn(self.order, self.steps, generator=generator, device=device)
+        self.base_c = torch.randn(self.order, self.steps, generator=generator, device=device)
+        self.direction_a = torch.randn(self.order, self.steps, generator=generator, device=device)
+        self.direction_c = torch.randn(self.order, self.steps, generator=generator, device=device)
+        self.projection = torch.randn(768, generator=generator, device=device)
+
+        self.base_a = self.base_a * self.active * self.base_std
+        self.base_c = self.base_c * self.active * self.base_std
+        self.direction_a = self._unit_rms(self.direction_a * self.active)
+        self.direction_c = self._unit_rms(self.direction_c * self.active)
+        self.projection = self.projection / self.projection.norm().clamp_min(1e-12)
+
+    @staticmethod
+    def _unit_rms(x: torch.Tensor) -> torch.Tensor:
+        norm = x.pow(2).mean().sqrt().clamp_min(1e-12)
+        return x / norm
+
+    def text_feature(self, cond_emb: torch.Tensor) -> torch.Tensor:
+        """Bounded prompt-only scalar from mean-pooled CLIP token embeddings."""
+        pooled = cond_emb.float().mean(dim=1)
+        pooled = pooled / pooled.norm(dim=1, keepdim=True).clamp_min(1e-12)
+        cosine = pooled @ self.projection
+        return torch.tanh(self.projection_gain * cosine)
+
+    def __call__(self, cond_emb: torch.Tensor) -> Tuple[Dict[str, torch.Tensor], torch.Tensor]:
+        batch_size = cond_emb.shape[0]
+        feature = self.text_feature(cond_emb)
+        if self.mode == "constant":
+            feature = torch.zeros_like(feature)
+
+        a_all = self.base_a.unsqueeze(0) + feature[:, None, None] * self.residual_std * self.direction_a
+        c_all = self.base_c.unsqueeze(0) + feature[:, None, None] * self.residual_std * self.direction_c
+        params: Dict[str, torch.Tensor] = {}
+        for i in range(self.order):
+            params[f"a{i + 1}_diff"] = a_all[:, i, :]
+            params[f"c{i + 1}_diff"] = c_all[:, i, :]
+        return params, feature
+
+
+def synthetic_noise_seeds(cfg: DictConfig) -> List[int]:
+    count = int(getattr(cfg, "count", 100))
+    mode = str(getattr(cfg, "noise_mode", "unique"))
+    seed = int(getattr(cfg, "noise_seed", 0))
+    if mode == "unique":
+        return list(range(seed, seed + count))
+    if mode == "fixed":
+        return [seed] * count
+    raise ValueError(f"Unknown synthetic noise_mode={mode!r}")
+
+
+def synthetic_prompts(cfg: DictConfig, prompts_path: str, count: int) -> List[str]:
+    prompts = parse_prompts_list(getattr(cfg, "prompts", None))
+    if prompts is None:
+        with open(prompts_path, "r", encoding="utf-8") as f:
+            prompts = [line.strip() for line in f if line.strip()]
+    if len(prompts) < count:
+        raise ValueError(f"Need {count} distinct prompts, got {len(prompts)}")
+    rng = np.random.default_rng(int(getattr(cfg, "prompt_seed", 0)))
+    indices = rng.permutation(len(prompts))[:count]
+    return [prompts[i] for i in indices]
 
 
 # ----------------------------------------------------------------------------
@@ -127,7 +177,7 @@ def main(config: DictConfig):
     config = OmegaConf.create(OmegaConf.to_container(config, resolve=True))
 
     outdir = config.outdir
-    seeds = parse_int_list(config.seeds)
+    noise_seeds = parse_int_list(config.seeds)
     max_batch_size = int(config.max_batch_size)
     # num_steps = config.num_steps
     checkpoint_path = config.checkpoint_path
@@ -135,11 +185,7 @@ def main(config: DictConfig):
     device = torch.device(config.device)
     dist.init()
 
-    num_batches = (
-        (len(seeds) - 1) // (max_batch_size * dist.get_world_size()) + 1
-    ) * dist.get_world_size()
-    all_batches = torch.as_tensor(seeds).tensor_split(num_batches)
-    rank_batches = all_batches[dist.get_rank() :: dist.get_world_size()]
+    sample_ids = list(range(len(noise_seeds)))
 
     # Rank 0 goes first.
     if dist.get_rank() != 0:
@@ -162,15 +208,8 @@ def main(config: DictConfig):
     )
 
     if use_synthetic_gs:
-        synthetic_count = int(getattr(synthetic_cfg, "count", 100))
-        fixed_noise_seed = int(getattr(synthetic_cfg, "fixed_noise_seed", 0))
-        # seeds = list(range(synthetic_count))
-        seeds = [i // 2 for i in range(synthetic_count)]
-        num_batches = (
-            (len(seeds) - 1) // (max_batch_size * dist.get_world_size()) + 1
-        ) * dist.get_world_size()
-        all_batches = torch.as_tensor(seeds).tensor_split(num_batches)
-        rank_batches = all_batches[dist.get_rank() :: dist.get_world_size()]
+        noise_seeds = synthetic_noise_seeds(synthetic_cfg)
+        sample_ids = list(range(len(noise_seeds)))
 
     num_steps = solver_config.steps # !
     # assert (num_steps is None) != (
@@ -221,74 +260,56 @@ def main(config: DictConfig):
         torch.distributed.barrier()
 
     shape = [None, model.image_channels, model.image_size, model.image_size]
-    fixed_noise = None
-    prompts_override = None
+    prompts_per_sample = None
+    coefficient_mapper = None
     if use_synthetic_gs:
-        fixed_noise_gen = torch.Generator(device=device).manual_seed(
-            fixed_noise_seed % (1 << 32)
+        prompts_path = getattr(model_config, "prompts_path", None)
+        if prompts_path is None:
+            raise ValueError("synthetic_gs_dataset needs model.prompts_path or explicit prompts.")
+        prompts_per_sample = synthetic_prompts(
+            synthetic_cfg, prompts_path, len(sample_ids)
         )
-        fixed_noise = torch.randn(
-            [1, model.image_channels, model.image_size, model.image_size],
-            generator=fixed_noise_gen,
-            device=device,
-        )
+        coefficient_mapper = SyntheticCoefficientMapper(gs_wrapper, synthetic_cfg, device)
 
-        prompts_override = parse_prompts_list(getattr(synthetic_cfg, "prompts", None))
-        if prompts_override is None:
-            prompts_path = getattr(model_config, "prompts_path", None)
-            if prompts_path is None:
-                raise ValueError("synthetic_gs_dataset needs prompts or model.prompts_path.")
-            with open(prompts_path, "r", encoding="utf-8") as f:
-                prompts_override = [line.strip() for line in f if line.strip()]
-        if len(prompts_override) < len(seeds):
-            raise ValueError(
-                f"Not enough prompts ({len(prompts_override)}) for {len(seeds)} samples."
-            )
-        prompt_seed = getattr(synthetic_cfg, "prompt_seed", None)
-        if prompt_seed is not None:
-            prompt_rng = np.random.default_rng(int(prompt_seed))
-            perm = prompt_rng.permutation(len(prompts_override))
-            prompts_override = [prompts_override[i] for i in perm]
-        prompts_override = prompts_override[: len(seeds)]
+    num_batches = (
+        (len(sample_ids) - 1) // (max_batch_size * dist.get_world_size()) + 1
+    ) * dist.get_world_size()
+    all_batches = torch.as_tensor(sample_ids).tensor_split(num_batches)
+    rank_batches = all_batches[dist.get_rank() :: dist.get_world_size()]
 
     # Loop over batches.
-    dist.print0(f'Generating {len(seeds)} images to "{outdir}"...')
-    for j, batch_seeds in tqdm.tqdm(
+    dist.print0(f'Generating {len(sample_ids)} images to "{outdir}"...')
+    for shard_idx, batch_ids in tqdm.tqdm(
         enumerate(rank_batches), unit="batch", disable=(dist.get_rank() != 0)
     ):
         torch.distributed.barrier()
 
-        batch_size = len(batch_seeds)
+        batch_size = len(batch_ids)
         if batch_size == 0:
             continue
+        batch_ids_list = batch_ids.tolist()
+        batch_noise_seeds = [noise_seeds[i] for i in batch_ids_list]
 
         shape[0] = batch_size
 
-        # Pick latents and labels.
-        # if use_synthetic_gs:
-        #     noise = fixed_noise.repeat(batch_size, 1, 1, 1)
-        # else:
-        rnd = StackedRandomGenerator(device, batch_seeds)
+        rnd = StackedRandomGenerator(device, batch_noise_seeds)
         noise = rnd.randn(shape, device=device)
-        # print(batch_seeds, noise.mean())
 
         condition = None
         if model_config.conditional:
             if use_synthetic_gs:
-                condition = [prompts_override[j % 2]]
+                condition = [prompts_per_sample[i] for i in batch_ids_list]
             else:
-                condition = model.iterate_condition(batch_seeds.tolist())
+                condition = model.iterate_condition(batch_noise_seeds)
 
         # Generate images.
         with torch.no_grad():
             manual_solver_params = None
+            synthetic_feature = None
             if use_synthetic_gs:
-                manual_solver_params = sample_manual_gs_params(
-                    gs_wrapper=gs_wrapper,
-                    batch_size=batch_size,
-                    device=device,
-                    cfg=synthetic_cfg,
-                    seed=0
+                model.set_condition(condition)
+                manual_solver_params, synthetic_feature = coefficient_mapper(
+                    model.model_fn.condition
                 )
             latents, images = sampler_fn(
                 noise=noise,
@@ -318,7 +339,9 @@ def main(config: DictConfig):
                     for k, v in (manual_solver_params or {}).items()
                 },
             }
-            torch.save(dataset, os.path.join(synt_dir, f"{j}.pt"))
+            if synthetic_feature is not None:
+                dataset["synthetic_prompt_feature"] = synthetic_feature.detach().cpu()
+            torch.save(dataset, os.path.join(synt_dir, f"{batch_ids_list[0]:06d}.pt"))
 
         # Save images.
         if model_config.type == "EDM":
@@ -335,9 +358,8 @@ def main(config: DictConfig):
             # Saves the batch in LDM style as in https://github.com/CompVis/latent-diffusion/blob/main/scripts/sample_diffusion.py
             images_np = custom_to_np(images)
 
-        for seed, image_np in zip(batch_seeds, images_np):
-            image_path = os.path.join(outdir, f"{j:06d}.png")
-            # print(f"{j:06d}.png", noise.mean(), 
+        for sample_id, image_np in zip(batch_ids_list, images_np):
+            image_path = os.path.join(outdir, f"{sample_id:06d}.png")
             PIL.Image.fromarray(image_np, "RGB").save(image_path)
 
     # Done.
