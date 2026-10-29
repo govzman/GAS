@@ -1,25 +1,31 @@
 # Controlled synthetic experiments
 
-One-time remote setup from the repository root:
+Run these scripts from the directory that contains `GAS/`, as in the existing
+cluster workflow. Under Slurm, the scripts locate the checkout via
+`SLURM_SUBMIT_DIR/GAS`, since Slurm executes a spool-file rather than the
+original script. Slurm keeps `outputs/*.out` and `outputs/*.err` relative to
+that parent directory.
+
+One-time remote setup:
 
 ```bash
-cp .env.example .env
+cp GAS/.env.example GAS/.env
 # Edit .env locally on the cluster and set COMET_API_KEY.
 ```
 
-Submit a teacher-generation job first. It also collates its 100 shards into
+Run a teacher-generation script first. It also collates its 100 shards into
 `dataset.pkl` when generation succeeds:
 
 ```bash
-sbatch scripts/slurm/generate_prompt_dependent.sh
+sbatch GAS/scripts/slurm/generate_prompt_dependent.sh
 ```
 
-After the matching generation job is complete, submit exactly one conditional
-and one global-baseline training job for that dataset:
+After the matching generation job is complete, run exactly one conditional and
+one global-baseline training script for that dataset:
 
 ```bash
-sbatch scripts/slurm/train_prompt_dependent_conditional.sh
-sbatch scripts/slurm/train_prompt_dependent_global.sh
+sbatch GAS/scripts/slurm/train_prompt_dependent_conditional.sh
+sbatch GAS/scripts/slurm/train_prompt_dependent_global.sh
 ```
 
 The remaining two controls use the corresponding `generate_*` and `train_*`
