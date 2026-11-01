@@ -820,6 +820,24 @@ class GSWrapperLatent(GSWrapper):
             assert d['gen_loss_adv'].shape == d[self.loss_config.loss_key].shape, f"SHAPE = {d['gen_loss_adv'].shape}, {d[self.loss_config.loss_key].shape}"
 
         base_loss = d[self.loss_config.loss_key]
+        if getattr(self.loss_config, "coefficient_supervision", False):
+            if not gt_solver_params:
+                raise ValueError("coefficient_supervision requires manual_solver_params in the dataset")
+            errors = []
+            for prefix in ("a", "c"):
+                for i in range(1, self.order + 1):
+                    name = f"{prefix}{i}_diff"
+                    if name not in gt_solver_params:
+                        raise ValueError(f"Missing teacher coefficient {name}")
+                    pred = getattr(self.solver, name)
+                    gt = gt_solver_params[name]
+                    if pred.ndim == 1:
+                        pred = pred.unsqueeze(0).expand_as(gt)
+                    if pred.shape != gt.shape:
+                        raise ValueError(f"{name}: predicted {pred.shape}, teacher {gt.shape}")
+                    errors.append((pred[:, i-1:] - gt[:, i-1:]).square())
+            d["loss_coeff_mse_active"] = torch.cat(errors, dim=1).mean(dim=1)
+            base_loss = d["loss_coeff_mse_active"]
         adv_part = self.loss_config.disc_weight * d.get("gen_loss_adv", 0.0)
         d["loss_total"] = adv_part + base_loss
 
