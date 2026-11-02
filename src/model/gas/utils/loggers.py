@@ -1,4 +1,5 @@
 import matplotlib.pyplot as plt
+import io
 import numpy as np
 import torch
 from typing import Dict, List, Mapping, Optional, Union
@@ -187,10 +188,24 @@ def log_end_img(
     ax[1].axis("off")
     ax[1].set_title("Teacher")
 
-    if global_step is None:
-        return
-
-    log_plt_fig(exp=exp, fig=fig, key=key, global_step=global_step)
+    try:
+        if global_step is None:
+            return
+        fig.tight_layout()
+        # Send a PNG image, not a matplotlib figure asset: Comet image panels
+        # can then group and compare these images by name and step.
+        buffer = io.BytesIO()
+        fig.savefig(buffer, format="png")
+        buffer.seek(0)
+        exp.log_image(
+            image_data=buffer,
+            name=key,
+            step=global_step,
+            image_format="png",
+            overwrite=False,
+        )
+    finally:
+        plt.close(fig)
 
 
 @torch.no_grad()
