@@ -1,0 +1,10 @@
+teacher_pkl: data/teachers/sd-v1/synthetic/prompt_dependent_500/dataset.pkl
+use_latents: true
+use_condition: true
+train_size: 500
+validation_size: 20
+batch_size: 2
+validation_batch_size: 2
+size_vis: 2
+dataset_shift: 0
+num_workers: 1

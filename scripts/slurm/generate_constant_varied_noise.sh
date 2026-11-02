@@ -3,7 +3,7 @@
 #SBATCH --output=outputs/generate_constant_varied_noise_%j.out
 #SBATCH --error=outputs/generate_constant_varied_noise_%j.err
 #SBATCH --gpus=1
-#SBATCH --partition=normal
+#SBATCH --partition=rocky
 #SBATCH --cpus-per-task=1
 #SBATCH --time=0-1:00
 #SBATCH --mail-user=idgovzman_2@edu.hse.ru
