@@ -596,7 +596,7 @@ class GSWrapper(nn.Module):
 
         Used on the synthetic dataset path where batch[4] carries teacher GT coeffs.
         """
-        if not gt_solver_params:
+        if not gt_solver_params or not getattr(self.loss_config, "log_gt_solver_metrics", True):
             return
         pred_all = self._predicted_gs_solver_tensors(noise, cond_emb)
         mse_list: List[torch.Tensor] = []

@@ -1,0 +1,21 @@
+defaults:
+  - gs_synt
+  - override datasets: synt_5to4_constant_500
+  - override student_solver: sd_student_baseline_ac_fixed_time
+  - _self_
+
+optimizer:
+  lr: 0.0001
+
+loss_config:
+  coefficient_supervision: false
+  log_gt_solver_metrics: false
+  loss_key: loss_l1_latents
+
+trainer:
+  n_iters: 5000
+
+writer:
+  checkpoint_freq: 250
+  run_name: synthetic-constant-latent-global-500train-lr-1e-4-5to4
+

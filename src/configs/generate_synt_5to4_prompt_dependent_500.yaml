@@ -1,0 +1,16 @@
+defaults:
+  - generate_synt_prompt_dependent
+  - _self_
+
+outdir: data/teachers/sd-v1/synthetic/5to4_prompt_dependent_500
+
+synthetic_gs_dataset:
+  count: 520
+  nfe: 5
+  order: 3
+  coefficient_mode: prompt_projection
+  residual_std: 0.01
+  # Shared prompt/noise seeds across both new controls.
+  noise_seed: 10000
+  prompt_seed: 2026
+
