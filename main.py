@@ -60,6 +60,14 @@ def main(config: DictConfig) -> None:
 
     base_model = load_base_model(model_config, device)
     gs_wrapper = get_gs_wrapper(base_model, config)
+    if gs_wrapper.shuffle_training_prompts:
+        if config.model.type != "SD":
+            raise ValueError("Training prompt shuffle is supported for SD only")
+        if config.loss_config.loss_type != "GS" or solver_config.t_requires_grad or solver_config.t_couple_requires_grad:
+            raise ValueError("Prompt-shuffle ablation requires GS with frozen t and t_couple")
+        train_subset = data.train_loader.dataset
+        conditions = train_subset.dataset.data["condition"]
+        gs_wrapper.set_training_prompt_pool([conditions[i] for i in train_subset.indices])
 
     # Single optimizer over all trainable parameters.
     trainable = [p for p in gs_wrapper.parameters() if p.requires_grad]

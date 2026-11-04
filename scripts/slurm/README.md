@@ -27,5 +27,27 @@ sbatch GAS/scripts/slurm/train_prompt_dependent_global.sh
 ```
 
 The remaining two controls use the corresponding `generate_*` and `train_*`
-scripts. Slurm output and error files are written to the tracked `outputs/`
-directory; its generated contents are ignored by Git.
+scripts. Slurm logs are written to `outputs/` beside `GAS/`.
+
+For the existing 500/20 dataset, two additional latent-loss ablations use the
+same seed, 5000 steps, batch size 2, lr=1e-4 and checkpoints every 250 steps:
+
+```bash
+sbatch GAS/scripts/slurm/train_prompt_latent_500_shuffled_prompt.sh
+sbatch GAS/scripts/slurm/train_prompt_latent_500_prompt_only.sh
+```
+
+The shuffle run samples a fresh unrelated prompt from the entire train pool
+for each predictor input during training. SD always receives the original
+prompt; validation uses correct prompts. Sampling is with replacement and
+excludes the current prompt; validation prompts never enter the pool.
+The prompt-only run removes the noise encoder and FiLM layers, retaining the
+text branch and output head plus global coefficient tables. Its smaller model
+changes capacity as well as inputs, which should be considered when comparing.
+To evaluate a checkpoint with the correct architecture, pass its config name:
+
+```bash
+GAS_CHECKPOINT=checkpoints/RUN/5000.pt python evaluate_coefficient_checkpoint.py --config-name gs_synt_500_prompt_only
+```
+
+That last command runs from inside `GAS/`, with the Python environment active.

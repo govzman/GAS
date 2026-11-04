@@ -1,4 +1,5 @@
 import contextlib
+import random
 import lpips
 
 import numpy as np
@@ -15,6 +16,7 @@ from src.model.gas.generalized_solver import GeneralizedSolver
 from src.model.gas.adversarial_module.dist_adv_loss import DistAdversarialTraining
 from src.model.gas.synt_data import SyntDataType
 from src.scheduler_model.film_mlp import PromptNoiseFiLMMlp
+from src.scheduler_model.film_mlp.film_mlp import PromptOnlyMLP
 
 
 class GSWrapper(nn.Module):
@@ -51,6 +53,9 @@ class GSWrapper(nn.Module):
         self.model = model
         self.solver_config = config.student_solver
         self.t_eps = self.model.t_eps
+        self.shuffle_training_prompts = bool(getattr(self.solver_config, "shuffle_training_prompts", False))
+        self._training_prompt_pool = None
+        self._prompt_rng = random.Random(int(getattr(config.trainer, "seed", 42))) if self.shuffle_training_prompts else None
         
         # create lpips
         self.loss_fn_vgg = lpips.LPIPS(net='vgg').requires_grad_(False)
@@ -240,11 +245,15 @@ class GSWrapper(nn.Module):
                     ),
                 )
             )
-            self.ac_coeff_model = PromptNoiseFiLMMlp(
-                out_dim=out_dim,
-                hidden_dim=hidden_dim,
-                in_channels=self.latent_channels,
-            )
+            input_mode = getattr(self.solver_config, "ac_input_mode", "noise_prompt")
+            if input_mode == "prompt_only":
+                self.ac_coeff_model = PromptOnlyMLP(out_dim, self.text_embed_dim, hidden_dim)
+            elif input_mode == "noise_prompt":
+                self.ac_coeff_model = PromptNoiseFiLMMlp(
+                    out_dim=out_dim, hidden_dim=hidden_dim, in_channels=self.latent_channels,
+                )
+            else:
+                raise ValueError(f"Unknown ac_input_mode={input_mode}")
         else:
             ac_cfg = getattr(config, "ac_scheduler_model", None)
             if ac_cfg is None:
@@ -275,6 +284,19 @@ class GSWrapper(nn.Module):
                 cfg_dict.pop("in_channels", None)
             cfg = OmegaConf.create(cfg_dict)
         return instantiate(cfg, **kwargs)
+
+    def set_training_prompt_pool(self, prompts):
+        """Use only train prompts; sample a fresh unrelated prompt per example."""
+        pool = sorted(set(prompts))
+        if len(pool) < 2 or not all(isinstance(p, str) for p in pool):
+            raise ValueError("Prompt shuffle requires at least two distinct train strings")
+        self._training_prompt_pool = pool
+
+    def sample_training_coefficient_prompts(self, condition):
+        if self._training_prompt_pool is None:
+            raise ValueError("Configure training prompt pool before shuffled training")
+        return [self._prompt_rng.choice([p for p in self._training_prompt_pool if p != original])
+                for original in condition]
 
     def should_log_final_solver_coeffs(self) -> bool:
         """True when effective coeffs live on the solver (not only static diff Parameters)."""
@@ -735,6 +757,7 @@ class GSWrapperLatent(GSWrapper):
         decode: bool = False,
         condition: Any = None,
         manual_solver_params: Optional[dict] = None,
+        coefficient_condition: Any = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Calls `sample` method of the Generalised Solver. 
         
@@ -747,6 +770,10 @@ class GSWrapperLatent(GSWrapper):
                 Not None if decode flag is set True.
         """
         images = None
+        coefficient_emb = None
+        if coefficient_condition is not None:
+            self.model.set_condition(coefficient_condition)
+            coefficient_emb = self.model.model_fn.condition
         if condition is not None:
             self.model.set_condition(condition)
         cond_emb = getattr(self.model.model_fn, "condition", None)
@@ -754,7 +781,9 @@ class GSWrapperLatent(GSWrapper):
         with self._manual_solver_params_context(manual_solver_params):
             if manual_solver_params is None:
                 self._update_dynamic_t_couple(noise=noise, cond_emb=cond_emb)
-                self._update_dynamic_ac_coefs(noise=noise, cond_emb=cond_emb)
+                self._update_dynamic_ac_coefs(
+                    noise=noise, cond_emb=coefficient_emb if coefficient_emb is not None else cond_emb
+                )
 
             latents = self.solver.sample(
                 x=noise,
@@ -778,9 +807,13 @@ class GSWrapperLatent(GSWrapper):
                 self.model.set_condition(condition)
             cond_emb = self.model.model_fn.condition
             d['timesteps'] = self.solver.get_time_steps(noise, cond_emb)
+        coefficient_condition = None
+        if is_train and self.shuffle_training_prompts:
+            coefficient_condition = self.sample_training_coefficient_prompts(condition)
         student_latents, _ = self.student_sampler_fn(
             noise,
-            condition=condition
+            condition=condition,
+            coefficient_condition=coefficient_condition,
         )
         cond_emb = getattr(self.model.model_fn, "condition", None)
         self._add_gt_solver_metrics(d, gt_solver_params, noise, cond_emb)

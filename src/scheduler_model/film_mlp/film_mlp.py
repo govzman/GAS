@@ -4,6 +4,26 @@ import torch
 from torch import nn
 
 
+class PromptOnlyMLP(nn.Module):
+    """Mean-pooled text predictor with the same prompt branch/head as FiLM."""
+
+    def __init__(self, out_dim: int, prompt_dim: int = 768, hidden_dim: int = 256):
+        super().__init__()
+        self.prompt_mlp = nn.Sequential(
+            nn.Linear(prompt_dim, hidden_dim), nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        self.head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim), nn.SiLU(),
+            nn.Linear(hidden_dim, out_dim),
+        )
+        nn.init.zeros_(self.head[-1].weight)
+        nn.init.zeros_(self.head[-1].bias)
+
+    def forward(self, noise: torch.Tensor, cond_emb: torch.Tensor) -> torch.Tensor:
+        return self.head(self.prompt_mlp(cond_emb.mean(dim=1)))
+
+
 class PromptNoiseFiLMMlp(nn.Module):
     """
     Maps (latent noise, prompt embedding) → flat coefficient vector.
