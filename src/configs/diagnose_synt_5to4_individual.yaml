@@ -1,0 +1,16 @@
+defaults:
+  - gs_synt_5to4_prompt_dependent_global_500
+  - _self_
+
+diagnostic:
+  weights: ema
+  split: validation
+  count: 8
+  selection_seed: 42
+  iterations: 250
+  lr: 0.0001
+  min_lr: 0.00001
+  grad_clip: 1.0
+  log_every: 25
+  shared_control: true
+  output_dir: outputs/individual_solver_5to4
