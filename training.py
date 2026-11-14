@@ -2,6 +2,7 @@ import datetime
 import os
 import time
 from typing import Optional
+import math
 
 import comet_ml
 import torch
@@ -21,6 +22,26 @@ from src.model.gas.utils.loggers import (
     log_weights,
     print_final_solver_coeffs,
 )
+
+
+def restore_training_state(checkpoint, model, optim, ema, lr_scheduler, target_step, device):
+    required = {"model", "ema", "step"} | ({"optim"} if optim is not None else set())
+    missing = required - set(checkpoint)
+    if missing:
+        raise ValueError(f"Resume checkpoint is missing: {sorted(missing)}")
+    step = int(checkpoint["step"])
+    if not 0 <= step < int(target_step):
+        raise ValueError("trainer.n_iters is the TOTAL target step and must exceed checkpoint step")
+    if (lr_scheduler is not None) != ("lr_scheduler" in checkpoint):
+        raise ValueError("Resume scheduler configuration must match the saved checkpoint")
+    model.load_state_dict(checkpoint["model"], strict=True)
+    if optim is not None:
+        optim.load_state_dict(checkpoint["optim"])
+    if lr_scheduler is not None:
+        lr_scheduler.load_state_dict(checkpoint["lr_scheduler"])
+    ema.load_state_dict(checkpoint["ema"])
+    ema.to(device=device)
+    return step
 
 
 def train(
@@ -51,6 +72,30 @@ def train(
     if optim and hasattr(config, "lr_scheduler") and config.lr_scheduler is not None:
         lr_scheduler = instantiate(config.lr_scheduler, optimizer=optim)
 
+    global_step = 0
+    resume_path = getattr(config.trainer, "resume_checkpoint", None)
+    if resume_path:
+        # Old checkpoints do not contain pending gradients, AMP scaler state
+        # or distributed sampler positions. Support the current single-GPU setup.
+        accumulation = int(getattr(config.trainer, "accumulation_steps",
+                                   getattr(config.trainer, "iters_to_accumulate", 1)))
+        if accumulation != 1 or str(getattr(config.trainer, "amp", "no")) != "no":
+            raise ValueError("Resume currently requires accumulation_steps=1 and amp=no")
+        if accelerator is not None and accelerator.num_processes != 1:
+            raise ValueError("Resume currently supports a single process/GPU")
+        checkpoint = torch.load(resume_path, map_location="cpu")
+        model_to_restore = accelerator.unwrap_model(gs_wrapper) if accelerator is not None else gs_wrapper
+        global_step = restore_training_state(
+            checkpoint, model_to_restore, optim, ema, lr_scheduler,
+            config.trainer.n_iters, device,
+        )
+        if is_main:
+            print(f"RESUME: {resume_path}, step {global_step} -> {config.trainer.n_iters}", flush=True)
+            if optim is not None:
+                print(f"Restored optimizer learning rates: {[g['lr'] for g in optim.param_groups]}", flush=True)
+            print("Data order restarts with a fresh shuffle; old checkpoints do not store the sampler position.", flush=True)
+        del checkpoint
+
     if is_main:
         dir = os.path.join("./checkpoints", date_str)
         os.makedirs(dir, exist_ok=False)
@@ -79,12 +124,18 @@ def train(
         exp.set_name(config.writer.run_name)
         exp.log_parameters(parameters=OmegaConf.to_container(config, resolve=True))
 
-    global_step = 0
-    pbar = tqdm(range(config.trainer.n_iters), dynamic_ncols=True) if is_main else None
+    pbar = tqdm(total=config.trainer.n_iters, initial=global_step, dynamic_ncols=True) if is_main else None
 
-    for _ in range(config.trainer.epoch_num):
+    if resume_path and exp is not None:
+        # Check restored validation losses before the first optimizer update.
+        evaluate_wrapper(exp, gs_wrapper, data, device, "", global_step)
+        with ema.average_parameters():
+            evaluate_wrapper(exp, gs_wrapper, data, device, "_ema", global_step)
+
+    remaining_epochs = math.ceil((config.trainer.n_iters - global_step) / len(data.train_loader))
+    for _ in range(remaining_epochs):
         for batch in data.train_loader:
-            if global_step == config.trainer.n_iters:
+            if global_step >= config.trainer.n_iters:
                 break
             global_step += 1
 
@@ -261,7 +312,8 @@ def train(
 
             gs_wrapper.set_retain_solver_coeff_grads(False)
 
-            if is_main and (global_step % config.writer.checkpoint_freq == 0 or global_step == 1):
+            if is_main and (global_step % config.writer.checkpoint_freq == 0 or global_step == 1
+                            or global_step == config.trainer.n_iters):
                 model_to_save = gs_wrapper
                 if accelerator is not None:
                     model_to_save = accelerator.unwrap_model(gs_wrapper)

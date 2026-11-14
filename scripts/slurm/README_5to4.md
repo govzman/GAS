@@ -92,3 +92,23 @@ sbatch GAS/scripts/slurm/evaluate_prompt_permutation_5to4.sh checkpoints/CONDITI
 This runs the correct 5-to-4 dataset/config, reports raw and EMA results over all
 20 validation examples, and leaves SD conditioning unchanged. No Comet key is
 needed for either diagnostic.
+
+## Continue the global run to step 10000
+
+```bash
+sbatch GAS/scripts/slurm/resume_synt_5to4_global_500.sh checkpoints/GLOBAL_RUN/5000.pt
+```
+
+Restores raw model weights, AdamW state (including its saved lr), EMA and any
+matching scheduler state. It performs 5000 additional updates from step 5000,
+with checkpoints every 250 steps in a NEW checkpoint directory and metrics in
+a NEW Comet experiment numbered 5000 through 10000. Raw and EMA validation are
+logged at step 5000 before updates, so they can be checked against the old run.
+The dataset and frozen time settings remain those of the original global run.
+Original checkpoint files are not overwritten.
+
+This resume path supports one GPU, amp=no and accumulation_steps=1. It restarts
+data shuffling: old checkpoints did not save RNG/sampler position, so the data
+stream is not a bitwise reproduction of an uninterrupted 10000-step run.
+The launcher accepts Hydra overrides after the checkpoint argument; n_iters is
+the absolute target step, not the number of additional updates.
